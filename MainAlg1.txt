@@ -1,0 +1,3103 @@
+package qfdnn;
+import com.sun.net.httpserver.HttpServer;
+import java.awt.Desktop;
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+public class Main {
+    private static final String CREDIT_FILE = "data/creditcard_csv.csv";
+    private static final String LOAN_FILE = "data/Loan_Data.csv";
+    private static final String SUMMARY_FILE = "results/qfdnn_summary.txt";
+    private static final int PCA_COMPONENTS = 7;
+    private static final int QUBITS = 3;
+    private static final int STATE_SIZE = 1 << QUBITS;
+    private static final double TEST_FRACTION = 0.20;
+    private static final int SMOTE_K = 5;
+    private static final int KMEANS_MAX_ITER = 100;
+    private static final long SEED = 42L;
+    private static final double EPS = 1.0e-12;
+    private static final int MAX_SAMPLES = 500;
+    private static final double PCA_CLIP = 3.0;
+    private static final boolean TUNE_THRESHOLD = true;
+    private static final int START_PORT = 8080;
+    private static final int MAX_EVALS = 300;             
+    private static final double COBYLA_RHO_BEGIN = 0.4;
+    private static final double COBYLA_RHO_END = 1.0e-5;
+    private static final double INIT_RANGE = 0.5;        
+    private static final int NOISE_STEPS = 10;            
+    private static final int NOISE_SHOTS = 20;            
+
+    public static void main(String[] args) {
+        new File("results").mkdirs();
+        System.out.println("QFDNN : running Algorithm 1, 2, 3 and 4 (this takes a little while) ...");
+
+        Set<String> creditDrop = new HashSet<String>();
+        creditDrop.add("time");
+        creditDrop.add("amount");
+        Set<String> loanDrop = new HashSet<String>();
+
+        List<DatasetResult> results = new ArrayList<DatasetResult>();
+        results.add(processDataset("CREDIT CARD FRAUD DETECTION", CREDIT_FILE, creditDrop, true));
+        results.add(processDataset("LOAN ELIGIBILITY PREDICTION", LOAN_FILE, loanDrop, false));
+
+        Map<String, String> pages = new LinkedHashMap<String, String>();
+        pages.put("alg1", renderAlg1(results));
+        pages.put("alg2", renderAlg2(results));
+        pages.put("alg3", renderAlg3(results));
+        pages.put("combined", renderCombined(results));
+        pages.put("alg4", renderAlg4(results));
+        pages.put("viz", renderViz(results));
+        pages.put("novelty", renderNovelty(results));
+
+        writeSummaryFile(results);
+        startServer(pages);
+    }
+    private static DatasetResult processDataset(String name, String path,
+                                                Set<String> dropCols, boolean balanced) {
+        DatasetResult result = new DatasetResult();
+        result.name = name;
+        try {
+            Prepared p = prepareDataset(name, path, dropCols, balanced);
+            result.prep = p;
+            double[][] centroidU0 = buildStatePreparationUnitary(p.centroidState0);
+            double[][] centroidU1 = buildStatePreparationUnitary(p.centroidState1);
+            ScoreModel model1 = new Alg1Model(centroidU0, centroidU1);
+            result.eval1 = evaluate("Algorithm 1 (UU-dagger with state-preparation unitaries)", model1, p);
+
+            result.report2 = buildAlg2Report(p);
+            final MultiQubitEnc.Circuit circuit0 = MultiQubitEnc.encode(p.centroidState0, QUBITS);
+            final MultiQubitEnc.Circuit circuit1 = MultiQubitEnc.encode(p.centroidState1, QUBITS);
+            ScoreModel modelCombined = new CombinedModel(circuit0, circuit1);
+            result.evalCombined = evaluate("Algorithm 2 circuits + Algorithm 1 UU-dagger",
+                    modelCombined, p);
+
+            
+            final Encoded enc = encodeAll(p);
+            result.enc = enc;
+            result.circuit0 = circuit0;
+            result.circuit1 = circuit1;
+
+            int dim = 2 * Parameter.paramCount(QUBITS);       
+            double[] init = randomTheta(dim, SEED + 11);
+            result.evalCombined3 = evaluateQfdnn("Algorithm 1 + 2 + 3 (PQC angles random, not trained)",
+                    enc, init, circuit0, circuit1, p);
+
+            System.out.println("  " + name + " : training QFDNN with COBYLA ...");
+            result.training4 = trainModel(init, new ScoreFn() {
+                public double[] scores(double[] theta) {
+                    return diffScores(qfdnnProbs(enc.trainStates, theta, circuit0, circuit1));
+                }
+            }, p.trainY, SEED + 33);
+            result.eval4 = evaluateQfdnn("Algorithm 4 : QFDNN (U + PQC + U-dagger + PQC, COBYLA trained)",
+                    enc, result.training4.theta, circuit0, circuit1, p);
+
+            // Train a second model with the actual ZGATRO objective on the SAME training split.
+            // The objective combines clean margin loss with six-channel, three-scale ZNE loss.
+            System.out.println("  " + name + " : training QFDNN with ZGATRO (ZNE + trust region) ...");
+            // ZGATRO refines the COBYLA-trained parameters rather than restarting randomly.
+            // This tests whether noise-guided refinement improves an already trained baseline.
+            Novelty.Result zres = Novelty.optimize(result.training4.theta, new Novelty.Objective() {
+                public double value(double[] theta) {
+                    return zgatroObjective(theta, enc, p.trainY, circuit0, circuit1);
+                }
+            }, 15, 0.01, 0.03, 0.001);
+            result.zgatroOptimization = zres;
+            result.evalZGATRO = evaluateQfdnn("Algorithm 4 : QFDNN (ZGATRO trained)",
+                    enc, zres.theta, circuit0, circuit1, p);
+            result.zgatroNoiseAcc = noiseSweep(p, enc, zres.theta, result.evalZGATRO.threshold,
+                    circuit0, circuit1);
+            double[] initVar = randomTheta(Parameter.paramCount(QUBITS), SEED + 22);
+            result.trainingVar = trainModel(initVar, new ScoreFn() {
+                public double[] scores(double[] theta) {
+                    return variationalScores(enc.trainStates, theta);
+                }
+            }, p.trainY, SEED + 44);
+            double[] varTest = variationalScores(enc.testStates, result.trainingVar.theta);
+            double[][] varProbs = new double[varTest.length][2];
+            for (int i = 0; i < varTest.length; i++) {
+                varProbs[i][0] = 1.0 - varTest[i];
+                varProbs[i][1] = varTest[i];
+            }
+            result.evalVar = evaluateScores("Variational part only (no UU-dagger)",
+                    variationalScores(enc.trainStates, result.trainingVar.theta), varTest, varProbs, p);
+
+            result.classical = new ArrayList<Evaluation>();
+            result.classical.add(fromPredictions("Logistic Regression",
+                    logisticRegression(p.trainPCA, p.trainY, p.testPCA), p.testY));
+            result.classical.add(fromPredictions("KNN (k=5)",
+                    knn(p.trainPCA, p.trainY, p.testPCA, 5), p.testY));
+            result.classical.add(fromPredictions("Random Forest",
+                    randomForest(p.trainPCA, p.trainY, p.testPCA, 50, SEED), p.testY));
+
+            System.out.println("  " + name + " : noise study ...");
+            result.noiseAcc = noiseSweep(p, enc, result.training4.theta, result.eval4.threshold,
+                    circuit0, circuit1);
+
+            System.out.println("  " + name + " : done");
+        } catch (Exception e) {
+            result.error = e.getMessage();
+            System.out.println("  " + name + " : ERROR - " + e.getMessage());
+            e.printStackTrace();
+        }
+        return result;
+    }
+
+    private static Prepared prepareDataset(String name, String path,
+                                           Set<String> dropCols, boolean balanced) throws IOException {
+        Prepared p = new Prepared();
+        p.name = name;
+
+        DataSet data = loadCSV(path, dropCols);
+        p.targetName = data.targetName;
+        p.label0 = data.c0;
+        p.label1 = data.c1;
+        p.loadedTotal = data.x.length;
+        p.loadedFeatures = data.x[0].length;
+        p.loaded0 = count(data.y, 0);
+        p.loaded1 = count(data.y, 1);
+
+        data = samplePaperStyle(data, balanced, MAX_SAMPLES, SEED);
+        p.used0 = count(data.y, 0);
+        p.used1 = count(data.y, 1);
+
+        Split sp = stratifiedSplit(data.x, data.y, TEST_FRACTION, SEED);
+        p.trainBefore0 = count(sp.trY, 0);
+        p.trainBefore1 = count(sp.trY, 1);
+        p.test0 = count(sp.teY, 0);
+        p.test1 = count(sp.teY, 1);
+
+        Standardizer scaler = Standardizer.fit(sp.trX);
+        scaler.transform(sp.trX);
+        scaler.transform(sp.teX);
+
+        int sizeBefore = sp.trX.length;
+        sp = smote(sp, SMOTE_K, SEED);
+        p.synthetic = sp.trX.length - sizeBefore;
+        p.trainAfter0 = count(sp.trY, 0);
+        p.trainAfter1 = count(sp.trY, 1);
+
+        PCA pca = PCA.fit(sp.trX, PCA_COMPONENTS);
+        double[][] trainPCA = pca.transform(sp.trX);
+        double[][] testPCA = pca.transform(sp.teX);
+
+        double[] sigma = columnStd(trainPCA);
+        toUnitRange(trainPCA, sigma);
+        toUnitRange(testPCA, sigma);
+
+        p.pcaDims = trainPCA[0].length;
+        p.trainPCA = trainPCA;
+        p.testPCA = testPCA;
+        p.trainY = sp.trY;
+        p.testY = sp.teY;
+
+        double[][] centroids = kmeansCentroids(trainPCA, sp.trY);
+        p.centroidState0 = amplitudeEncode(centroids[0]);
+        p.centroidState1 = amplitudeEncode(centroids[1]);
+        p.centroidOverlap = dot(p.centroidState0, p.centroidState1);
+
+        return p;
+    }
+
+    private static double[][] buildStatePreparationUnitary(double[] state) {
+        double[] v = new double[STATE_SIZE];
+        for (int i = 0; i < STATE_SIZE; i++) {
+            v[i] = -state[i];
+        }
+        v[0] = v[0] + 1.0;
+        double vNormSquared = dot(v, v);
+
+        double[][] U = new double[STATE_SIZE][STATE_SIZE];
+        for (int i = 0; i < STATE_SIZE; i++) {
+            U[i][i] = 1.0;
+        }
+        if (vNormSquared > EPS) {
+            double factor = 2.0 / vNormSquared;
+            for (int i = 0; i < STATE_SIZE; i++) {
+                for (int j = 0; j < STATE_SIZE; j++) {
+                    U[i][j] = U[i][j] - factor * v[i] * v[j];
+                }
+            }
+        }
+        return U;
+    }
+
+    private static double alg1Amplitude(double[][] testUnitary, double[][] centroidUnitary) {
+        double[][] A = multiplyMatrices(transpose(testUnitary), centroidUnitary);
+        double[] zero = new double[STATE_SIZE];
+        zero[0] = 1.0;
+        double[] result = multiplyVector(A, zero);
+        return result[0];
+    }
+
+    private interface ScoreModel {
+        double amplitude(double[] testState, int classIndex);
+    }
+
+    private static class Alg1Model implements ScoreModel {
+        private final double[][] centroidU0;
+        private final double[][] centroidU1;
+
+        Alg1Model(double[][] centroidU0, double[][] centroidU1) {
+            this.centroidU0 = centroidU0;
+            this.centroidU1 = centroidU1;
+        }
+
+        public double amplitude(double[] testState, int classIndex) {
+            double[][] testUnitary = buildStatePreparationUnitary(testState);
+            if (classIndex == 0) {
+                return alg1Amplitude(testUnitary, centroidU0);
+            }
+            return alg1Amplitude(testUnitary, centroidU1);
+        }
+    }
+
+    private static class CombinedModel implements ScoreModel {
+        private final MultiQubitEnc.Circuit centroidCircuit0;
+        private final MultiQubitEnc.Circuit centroidCircuit1;
+
+        CombinedModel(MultiQubitEnc.Circuit c0, MultiQubitEnc.Circuit c1) {
+            this.centroidCircuit0 = c0;
+            this.centroidCircuit1 = c1;
+        }
+
+        public double amplitude(double[] testState, int classIndex) {
+            MultiQubitEnc.Circuit testCircuit = MultiQubitEnc.encode(testState, QUBITS);
+            if (classIndex == 0) {
+                return MultiQubitEnc.overlapAmplitude(testCircuit, centroidCircuit0);
+            }
+            return MultiQubitEnc.overlapAmplitude(testCircuit, centroidCircuit1);
+        }
+    }
+
+    private static Evaluation evaluate(String method, ScoreModel model, Prepared p) {
+
+        Evaluation ev = new Evaluation();
+        ev.method = method;
+
+        int trainCount = p.trainPCA.length;
+        double[] trainScore = new double[trainCount];
+
+        for (int i = 0; i < trainCount; i++) {
+            double[] state = amplitudeEncode(p.trainPCA[i]);
+            double a0 = model.amplitude(state, 0);
+            double a1 = model.amplitude(state, 1);
+            trainScore[i] = a1 * a1 - a0 * a0;
+        }
+
+        ev.threshold = 0.0;
+        if (TUNE_THRESHOLD) {
+            ev.threshold = bestThreshold(trainScore, p.trainY);
+        }
+
+        int testCount = p.testPCA.length;
+        ev.testCount = testCount;
+        ev.confusion = new int[2][2];
+        ev.probs = new double[testCount][2];
+        ev.predicted = new int[testCount];
+        ev.actual = new int[testCount];
+        ev.maxDeviation = 0.0;
+
+        for (int i = 0; i < testCount; i++) {
+            double[] state = amplitudeEncode(p.testPCA[i]);
+            double a0 = model.amplitude(state, 0);
+            double a1 = model.amplitude(state, 1);
+
+            double p0 = a0 * a0;
+            double p1 = a1 * a1;
+            double direct0 = sq(dot(p.centroidState0, state));
+            double direct1 = sq(dot(p.centroidState1, state));
+            ev.maxDeviation = Math.max(ev.maxDeviation, Math.abs(p0 - direct0));
+            ev.maxDeviation = Math.max(ev.maxDeviation, Math.abs(p1 - direct1));
+
+            int predicted = 0;
+            if (p1 - p0 > ev.threshold) {
+                predicted = 1;
+            }
+
+            ev.probs[i][0] = p0;
+            ev.probs[i][1] = p1;
+            ev.predicted[i] = predicted;
+            ev.actual[i] = p.testY[i];
+            ev.confusion[p.testY[i]][predicted]++;
+
+            if (i == 0) {
+                ev.firstState = state;
+                ev.firstA0 = a0;
+                ev.firstA1 = a1;
+            }
+        }
+
+        computeMetrics(ev);
+        return ev;
+    }
+
+    private static void computeMetrics(Evaluation ev) {
+        int tn = ev.confusion[0][0];
+        int fp = ev.confusion[0][1];
+        int fn = ev.confusion[1][0];
+        int tp = ev.confusion[1][1];
+        ev.accuracy = (tp + tn) / (double) Math.max(1, ev.testCount);
+        ev.precision = 0.0;
+        if (tp + fp > 0) {
+            ev.precision = tp / (double) (tp + fp);
+        }
+        ev.recall = 0.0;
+        if (tp + fn > 0) {
+            ev.recall = tp / (double) (tp + fn);
+        }
+        ev.f1 = 0.0;
+        if (ev.precision + ev.recall > 0) {
+            ev.f1 = 2.0 * ev.precision * ev.recall / (ev.precision + ev.recall);
+        }
+    }
+    private static Alg2Report buildAlg2Report(Prepared p) {
+
+        Alg2Report r = new Alg2Report();
+        r.qubits = QUBITS;
+        r.centroidCircuit0 = MultiQubitEnc.encode(p.centroidState0, QUBITS);
+        r.centroidCircuit1 = MultiQubitEnc.encode(p.centroidState1, QUBITS);
+        r.firstTarget = amplitudeEncode(p.testPCA[0]);
+        r.firstCircuit = MultiQubitEnc.encode(r.firstTarget, QUBITS);
+        r.firstEncoded = MultiQubitEnc.run(r.firstCircuit);
+
+        double minFidelity = 1.0;
+        double sumFidelity = 0.0;
+        double maxError = 0.0;
+        int checked = 0;
+
+        List<MultiQubitEnc.Circuit> all = new ArrayList<MultiQubitEnc.Circuit>();
+        all.add(r.centroidCircuit0);
+        all.add(r.centroidCircuit1);
+        for (int i = 0; i < p.testPCA.length; i++) {
+            double[] state = amplitudeEncode(p.testPCA[i]);
+            all.add(MultiQubitEnc.encode(state, QUBITS));
+        }
+
+        for (MultiQubitEnc.Circuit circuit : all) {
+            double fidelity = MultiQubitEnc.fidelity(circuit);
+            minFidelity = Math.min(minFidelity, fidelity);
+            sumFidelity += fidelity;
+            maxError = Math.max(maxError, MultiQubitEnc.maxAmplitudeError(circuit));
+            checked++;
+        }
+
+        r.checked = checked;
+        r.minFidelity = minFidelity;
+        r.meanFidelity = sumFidelity / Math.max(1, checked);
+        r.maxError = maxError;
+        return r;
+    }
+
+    private static Encoded encodeAll(Prepared p) {
+        Encoded e = new Encoded();
+        e.trainStates = new double[p.trainPCA.length][];
+        e.trainCircuits = new MultiQubitEnc.Circuit[p.trainPCA.length];
+        for (int i = 0; i < p.trainPCA.length; i++) {
+            // Keep the encoded training circuits so ZGATRO can evaluate its noisy objective.
+            MultiQubitEnc.Circuit c = MultiQubitEnc.encode(amplitudeEncode(p.trainPCA[i]), QUBITS);
+            e.trainCircuits[i] = c;
+            e.trainStates[i] = MultiQubitEnc.run(c);
+        }
+        e.testStates = new double[p.testPCA.length][];
+        e.testCircuits = new MultiQubitEnc.Circuit[p.testPCA.length];
+        for (int i = 0; i < p.testPCA.length; i++) {
+            MultiQubitEnc.Circuit c = MultiQubitEnc.encode(amplitudeEncode(p.testPCA[i]), QUBITS);
+            e.testCircuits[i] = c;
+            e.testStates[i] = MultiQubitEnc.run(c);
+        }
+        return e;
+    }
+
+    private static double[] randomTheta(int dim, long seed) {
+        Random random = new Random(seed);
+        double[] theta = new double[dim];
+        for (int i = 0; i < dim; i++) {
+            theta[i] = (2.0 * random.nextDouble() - 1.0) * INIT_RANGE;
+        }
+        return theta;
+    }
+    private static double[][] qfdnnProbs(double[][] states, double[] theta,
+                                         MultiQubitEnc.Circuit c0, MultiQubitEnc.Circuit c1) {
+        int half = Parameter.paramCount(QUBITS);
+        Parameter.Circuit q1 = Parameter.constructCircuit(QUBITS, Arrays.copyOfRange(theta, 0, half));
+        Parameter.Circuit q2 = Parameter.constructCircuit(QUBITS, Arrays.copyOfRange(theta, half, 2 * half));
+
+        double[][] out = new double[states.length][2];
+        for (int i = 0; i < states.length; i++) {
+            out[i][0] = branchProbability(states[i], q1, c0, q2);
+            out[i][1] = branchProbability(states[i], q1, c1, q2);
+        }
+        return out;
+    }
+
+    private static double branchProbability(double[] state, Parameter.Circuit q1,
+                                            MultiQubitEnc.Circuit centroid, Parameter.Circuit q2) {
+        double[] re = state.clone();
+        double[] im = new double[state.length];
+        Parameter.apply(q1, re, im);
+        MultiQubitEnc.runInverse(re, centroid);      
+        MultiQubitEnc.runInverse(im, centroid);
+        Parameter.apply(q2, re, im);
+        return re[0] * re[0] + im[0] * im[0];
+    }
+
+    private static double[] diffScores(double[][] probs) {
+        double[] s = new double[probs.length];
+        for (int i = 0; i < s.length; i++) {
+            s[i] = probs[i][1] - probs[i][0];
+        }
+        return s;
+    }
+    private static double[] variationalScores(double[][] states, double[] theta) {
+        Parameter.Circuit q = Parameter.constructCircuit(QUBITS, theta);
+        int mask = 1 << (QUBITS - 1);
+        double[] s = new double[states.length];
+        for (int k = 0; k < states.length; k++) {
+            double[] re = states[k].clone();
+            double[] im = new double[re.length];
+            Parameter.apply(q, re, im);
+            double sum = 0.0;
+            for (int i = 0; i < re.length; i++) {
+                if ((i & mask) != 0) {
+                    sum += re[i] * re[i] + im[i] * im[i];
+                }
+            }
+            s[k] = sum;
+        }
+        return s;
+    }
+
+    private static double thresholdFor(double[] score, int[] labels) {
+        if (TUNE_THRESHOLD) {
+            return bestThreshold(score, labels);
+        }
+        return 0.0;
+    }
+    private static double lossOf(double[] score, int[] labels) {
+        double thr = thresholdFor(score, labels);
+        int ok = 0;
+        for (int i = 0; i < score.length; i++) {
+            int predicted = 0;
+            if (score[i] > thr) {
+                predicted = 1;
+            }
+            if (predicted == labels[i]) {
+                ok++;
+            }
+        }
+        return 1.0 - ok / (double) score.length;
+    }
+
+    private interface ScoreFn {
+        double[] scores(double[] theta);
+    }
+
+    private static Training trainModel(final double[] theta0, final ScoreFn fn, final int[] labels, long seed) {
+
+        Cobyla.Result r = Cobyla.minimize(new Cobyla.Objective() {
+            public double value(double[] x) {
+                return lossOf(fn.scores(x), labels);
+            }
+        }, theta0, COBYLA_RHO_BEGIN, COBYLA_RHO_END, MAX_EVALS, seed);
+
+        Training t = new Training();
+        t.theta0 = theta0.clone();
+        t.theta = r.x;
+        t.lossHistory = r.bestHistory;
+        t.evaluations = r.evaluations;
+        t.stop = r.stopReason;
+        t.initialLoss = r.bestHistory.get(0);
+        t.finalLoss = r.fx;
+        return t;
+    }
+
+    private static Evaluation evaluateQfdnn(String method, Encoded enc, double[] theta,
+                                            MultiQubitEnc.Circuit c0, MultiQubitEnc.Circuit c1, Prepared p) {
+        double[][] trainP = qfdnnProbs(enc.trainStates, theta, c0, c1);
+        double[][] testP = qfdnnProbs(enc.testStates, theta, c0, c1);
+        return evaluateScores(method, diffScores(trainP), diffScores(testP), testP, p);
+    }
+
+    private static Evaluation evaluateScores(String method, double[] trainScore, double[] testScore,
+                                             double[][] testProbs, Prepared p) {
+        Evaluation ev = new Evaluation();
+        ev.method = method;
+        ev.threshold = thresholdFor(trainScore, p.trainY);
+        int n = testScore.length;
+        ev.testCount = n;
+        ev.confusion = new int[2][2];
+        ev.predicted = new int[n];
+        ev.actual = new int[n];
+        ev.probs = testProbs;
+        for (int i = 0; i < n; i++) {
+            int predicted = 0;
+            if (testScore[i] > ev.threshold) {
+                predicted = 1;
+            }
+            ev.predicted[i] = predicted;
+            ev.actual[i] = p.testY[i];
+            ev.confusion[p.testY[i]][predicted]++;
+        }
+        computeMetrics(ev);
+        return ev;
+    }
+
+    private static Evaluation fromPredictions(String name, int[] predicted, int[] actual) {
+        Evaluation ev = new Evaluation();
+        ev.method = name;
+        ev.testCount = actual.length;
+        ev.confusion = new int[2][2];
+        ev.predicted = predicted;
+        ev.actual = actual;
+        for (int i = 0; i < actual.length; i++) {
+            ev.confusion[actual[i]][predicted[i]]++;
+        }
+        computeMetrics(ev);
+        return ev;
+    }
+
+    /**
+     * ZGATRO objective: clean differentiable margin loss + mean ZNE-mitigated
+     * margin loss over all six channels. Uses only a fixed, deterministic subset
+     * of training rows so finite-difference evaluations remain practical.
+     */
+    private static double zgatroObjective(double[] theta, Encoded enc, int[] labels,
+                                           MultiQubitEnc.Circuit c0, MultiQubitEnc.Circuit c1) {
+        final int[] sampleIndices = balancedObjectiveIndices(labels, 6);
+        final int sampleCount = sampleIndices.length;
+        final double[] scales = {1.0, 2.0, 3.0};
+        final double baseNoise = 0.06;
+        final double lambda = 0.65;
+        final double beta = 0.05;
+        int half = Parameter.paramCount(QUBITS);
+        double[] th1 = Arrays.copyOfRange(theta, 0, half);
+        double[] th2 = Arrays.copyOfRange(theta, half, theta.length);
+        double cleanLoss = 0.0;
+        for (int si = 0; si < sampleCount; si++) {
+            int i = sampleIndices[si];
+            double[][] probs = qfdnnProbs(new double[][]{enc.trainStates[i]}, theta, c0, c1);
+            double score = probs[0][1] - probs[0][0];
+            double target = labels[i] == 1 ? 1.0 : -1.0;
+            double margin = Math.max(0.0, 0.5 - target * score);
+            cleanLoss += margin * margin;
+        }
+        cleanLoss /= sampleCount;
+
+        double noisyLoss = 0.0;
+        double residualPenalty = 0.0;
+        int channelCount = Parameter.NOISE_NAMES.length;
+        for (int ch = 0; ch < channelCount; ch++) {
+            for (int sample = 0; sample < sampleCount; sample++) {
+                int i = sampleIndices[sample];
+                double[] p0 = new double[3];
+                double[] p1 = new double[3];
+                for (int si = 0; si < scales.length; si++) {
+                    // Common random numbers across parameter values stabilize finite differences.
+                    long seed = 73471L + ch * 1009L + i * 97L + si * 31L;
+                    Random rnd = new Random(seed);
+                    double strength = Math.min(0.90, baseNoise * scales[si]);
+                    p0[si] = Parameter.runNoisy(enc.trainCircuits[i], th1, c0, th2, ch, strength, rnd);
+                    p1[si] = Parameter.runNoisy(enc.trainCircuits[i], th1, c1, th2, ch, strength, rnd);
+                }
+                double z0 = Novelty.extrapolateZeroNoise(scales, p0);
+                double z1 = Novelty.extrapolateZeroNoise(scales, p1);
+                double target = labels[i] == 1 ? 1.0 : -1.0;
+                double margin = Math.max(0.0, 0.5 - target * (z1 - z0));
+                noisyLoss += margin * margin;
+                // Penalize scale-to-line disagreement: a larger residual means less reliable extrapolation.
+                residualPenalty += Math.pow(p0[2] - (2.0 * p0[1] - p0[0]), 2)
+                                 + Math.pow(p1[2] - (2.0 * p1[1] - p1[0]), 2);
+            }
+        }
+        double denom = channelCount * sampleCount;
+        noisyLoss /= denom;
+        residualPenalty /= (2.0 * denom);
+        return cleanLoss + lambda * noisyLoss + beta * residualPenalty;
+    }
+
+    private static int[] balancedObjectiveIndices(int[] labels, int perClass) {
+        List<Integer> zero = new ArrayList<Integer>();
+        List<Integer> one = new ArrayList<Integer>();
+        for (int i = 0; i < labels.length; i++) {
+            if (labels[i] == 0 && zero.size() < perClass) zero.add(i);
+            else if (labels[i] == 1 && one.size() < perClass) one.add(i);
+            if (zero.size() >= perClass && one.size() >= perClass) break;
+        }
+        List<Integer> selected = new ArrayList<Integer>();
+        selected.addAll(zero); selected.addAll(one);
+        if (selected.isEmpty()) throw new IllegalArgumentException("No training rows available for ZGATRO.");
+        int[] out = new int[selected.size()];
+        for (int i = 0; i < out.length; i++) out[i] = selected.get(i);
+        return out;
+    }
+
+    private static double[][] noiseSweep(Prepared p, Encoded enc, double[] theta, double threshold,
+                                         MultiQubitEnc.Circuit c0, MultiQubitEnc.Circuit c1) {
+
+        int half = Parameter.paramCount(QUBITS);
+        double[] th1 = Arrays.copyOfRange(theta, 0, half);
+        double[] th2 = Arrays.copyOfRange(theta, half, 2 * half);
+        int n = p.testPCA.length;
+        Random rnd = new Random(SEED + 500);
+
+        double[][] acc = new double[Parameter.NOISE_NAMES.length][NOISE_STEPS + 1];
+
+        for (int t = 0; t < acc.length; t++) {
+            for (int s = 0; s <= NOISE_STEPS; s++) {
+                double prob = (double) s / NOISE_STEPS;
+                int shots = (s == 0) ? 1 : NOISE_SHOTS;
+                int ok = 0;
+                for (int i = 0; i < n; i++) {
+                    double s0 = 0.0;
+                    double s1 = 0.0;
+                    for (int k = 0; k < shots; k++) {
+                        s0 += Parameter.runNoisy(enc.testCircuits[i], th1, c0, th2, t, prob, rnd);
+                        s1 += Parameter.runNoisy(enc.testCircuits[i], th1, c1, th2, t, prob, rnd);
+                    }
+                    int predicted = 0;
+                    if ((s1 - s0) / shots > threshold) {
+                        predicted = 1;
+                    }
+                    if (predicted == p.testY[i]) {
+                        ok++;
+                    }
+                }
+                acc[t][s] = ok / (double) n;
+            }
+        }
+        return acc;
+    }
+    private static int[] logisticRegression(double[][] X, int[] y, double[][] T) {
+        int n = X.length;
+        int d = X[0].length;
+        double[] w = new double[d];
+        double b = 0.0;
+        double lr = 1.0;
+        double lambda = 1.0e-3;
+
+        for (int epoch = 0; epoch < 2000; epoch++) {
+            double[] gw = new double[d];
+            double gb = 0.0;
+            for (int i = 0; i < n; i++) {
+                double z = b;
+                for (int j = 0; j < d; j++) {
+                    z += w[j] * (X[i][j] - 0.5);
+                }
+                double err = 1.0 / (1.0 + Math.exp(-z)) - y[i];
+                for (int j = 0; j < d; j++) {
+                    gw[j] += err * (X[i][j] - 0.5);
+                }
+                gb += err;
+            }
+            for (int j = 0; j < d; j++) {
+                w[j] -= lr * (gw[j] / n + lambda * w[j]);
+            }
+            b -= lr * gb / n;
+        }
+
+        int[] out = new int[T.length];
+        for (int i = 0; i < T.length; i++) {
+            double z = b;
+            for (int j = 0; j < d; j++) {
+                z += w[j] * (T[i][j] - 0.5);
+            }
+            if (z > 0.0) {
+                out[i] = 1;
+            }
+        }
+        return out;
+    }
+
+    private static int[] knn(double[][] X, int[] y, double[][] T, int k) {
+        int[] out = new int[T.length];
+        for (int i = 0; i < T.length; i++) {
+            final double[] distance = new double[X.length];
+            Integer[] order = new Integer[X.length];
+            for (int j = 0; j < X.length; j++) {
+                distance[j] = dist(T[i], X[j]);
+                order[j] = j;
+            }
+            Arrays.sort(order, new Comparator<Integer>() {
+                public int compare(Integer a, Integer b) {
+                    return Double.compare(distance[a], distance[b]);
+                }
+            });
+            int votes = 0;
+            for (int m = 0; m < k; m++) {
+                votes += y[order[m]];
+            }
+            if (votes * 2 > k) {
+                out[i] = 1;
+            }
+        }
+        return out;
+    }
+
+    private static class TreeNode {
+        int feature = -1;
+        double threshold;
+        TreeNode left;
+        TreeNode right;
+        double prob;
+    }
+
+    private static int[] randomForest(double[][] X, int[] y, double[][] T, int trees, long seed) {
+        Random random = new Random(seed + 900);
+        List<TreeNode> forest = new ArrayList<TreeNode>();
+        int n = X.length;
+        for (int t = 0; t < trees; t++) {
+            List<Integer> sample = new ArrayList<Integer>();
+            for (int i = 0; i < n; i++) {
+                sample.add(random.nextInt(n));
+            }
+            forest.add(buildTree(sample, X, y, 0, random));
+        }
+        int[] out = new int[T.length];
+        for (int i = 0; i < T.length; i++) {
+            double sum = 0.0;
+            for (TreeNode root : forest) {
+                TreeNode node = root;
+                while (node.feature >= 0) {
+                    if (T[i][node.feature] <= node.threshold) {
+                        node = node.left;
+                    } else {
+                        node = node.right;
+                    }
+                }
+                sum += node.prob;
+            }
+            if (sum / trees >= 0.5) {
+                out[i] = 1;
+            }
+        }
+        return out;
+    }
+
+    private static TreeNode buildTree(List<Integer> idx, final double[][] X, int[] y, int depth, Random random) {
+
+        TreeNode node = new TreeNode();
+        int pos = 0;
+        for (int i : idx) {
+            pos += y[i];
+        }
+        node.prob = pos / (double) idx.size();
+
+        if (pos == 0 || pos == idx.size() || depth >= 12 || idx.size() < 4) {
+            return node;
+        }
+
+        int d = X[0].length;
+        List<Integer> features = new ArrayList<Integer>();
+        for (int j = 0; j < d; j++) {
+            features.add(j);
+        }
+        Collections.shuffle(features, random);
+        int tryCount = Math.max(1, (int) Math.sqrt(d));
+
+        double bestGini = Double.MAX_VALUE;
+        int bestFeature = -1;
+        double bestThr = 0.0;
+
+        for (int fi = 0; fi < tryCount; fi++) {
+            final int f = features.get(fi);
+            List<Integer> sorted = new ArrayList<Integer>(idx);
+            Collections.sort(sorted, new Comparator<Integer>() {
+                public int compare(Integer a, Integer b) {
+                    return Double.compare(X[a][f], X[b][f]);
+                }
+            });
+            int total = sorted.size();
+            int leftPos = 0;
+            for (int k = 0; k < total - 1; k++) {
+                leftPos += y[sorted.get(k)];
+                double a = X[sorted.get(k)][f];
+                double b = X[sorted.get(k + 1)][f];
+                if (a >= b) {
+                    continue;
+                }
+                int leftN = k + 1;
+                int rightN = total - leftN;
+                int rightPos = pos - leftPos;
+                double gl = 1.0 - sq(leftPos / (double) leftN) - sq(1.0 - leftPos / (double) leftN);
+                double gr = 1.0 - sq(rightPos / (double) rightN) - sq(1.0 - rightPos / (double) rightN);
+                double gini = (leftN * gl + rightN * gr) / total;
+                if (gini < bestGini) {
+                    bestGini = gini;
+                    bestFeature = f;
+                    bestThr = 0.5 * (a + b);
+                }
+            }
+        }
+
+        if (bestFeature < 0) {
+            return node;
+        }
+
+        List<Integer> left = new ArrayList<Integer>();
+        List<Integer> right = new ArrayList<Integer>();
+        for (int i : idx) {
+            if (X[i][bestFeature] <= bestThr) {
+                left.add(i);
+            } else {
+                right.add(i);
+            }
+        }
+        if (left.isEmpty() || right.isEmpty()) {
+            return node;
+        }
+
+        node.feature = bestFeature;
+        node.threshold = bestThr;
+        node.left = buildTree(left, X, y, depth + 1, random);
+        node.right = buildTree(right, X, y, depth + 1, random);
+        return node;
+    }
+    private interface Section {
+        void write(StringBuilder sb, DatasetResult dr);
+    }
+
+    private static String renderPage(String heading, String note, List<DatasetResult> results, Section section) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<h1>").append(heading).append("</h1>");
+        sb.append("<p class='note'>").append(note).append("</p>");
+        for (DatasetResult dr : results) {
+            sb.append("<section class='dataset'>");
+            sb.append("<h2>").append(h(dr.name)).append("</h2>");
+            if (dr.error != null) {
+                sb.append("<div class='error'>Could not run this dataset: ").append(h(dr.error)).append("</div>");
+            } else {
+                section.write(sb, dr);
+            }
+            sb.append("</section>");
+        }
+        return sb.toString();
+    }
+
+    private static String renderAlg1(List<DatasetResult> results) {
+        return renderPage("Result of Algorithm 1 &ndash; UU&dagger; method",
+                "The state-preparation unitaries U<sub>1</sub> (centroid) and U<sub>2</sub> (test data) are "
+                + "ordinary 8&times;8 matrices. A = U<sub>2</sub>&dagger;U<sub>1</sub>, "
+                + "a<sub>0</sub> = &lang;000|A|000&rang; = &lang;C|T&rang;, P = |a<sub>0</sub>|&sup2;.",
+                results, new Section() {
+            public void write(StringBuilder sb, DatasetResult dr) {
+                appendDataSummary(sb, dr.prep);
+                appendSplitTables(sb, dr.prep);
+                sb.append("<h3>Algorithm 1 &ndash; classification result</h3>");
+                appendEvaluation(sb, dr.eval1, dr.prep);
+            }
+        });
+    }
+
+    private static String renderAlg2(List<DatasetResult> results) {
+        return renderPage("Result of Algorithm 2 &ndash; Multiple Qubit Amplitude Encoding",
+                "Class <b>MultiQubitEnc</b> builds the circuit with 1 + 2 + 4 controlled / anti-controlled U gates "
+                + "on 3 qubits and encodes 7 features (+1 zero pad) into 8 amplitudes.",
+                results, new Section() {
+            public void write(StringBuilder sb, DatasetResult dr) {
+                appendDataSummary(sb, dr.prep);
+                appendAlg2(sb, dr.report2, dr.prep);
+            }
+        });
+    }
+
+    private static String renderAlg3(List<DatasetResult> results) {
+        return renderPage("Result of Algorithm 3 &ndash; Parametrized Circuit Construction",
+                "Class <b>Parameter</b> builds the variational circuit of Fig. 3(c): an R<sub>Y</sub> layer, an "
+                + "R<sub>Z</sub> layer, a chain of CX gates and a second R<sub>Y</sub> layer. "
+                + "QFDNN uses two of these blocks, one after U and one after U&dagger;. "
+                + "The &quot;initial&quot; angles are the random starting point, the &quot;trained&quot; angles "
+                + "come from the COBYLA run of Algorithm 4.",
+                results, new Section() {
+            public void write(StringBuilder sb, DatasetResult dr) {
+                appendAlg3(sb, dr);
+            }
+        });
+    }
+
+    private static String renderCombined(List<DatasetResult> results) {
+        return renderPage("Combined Result &ndash; Algorithm 1 + 2 + 3 (QFDNN structure)",
+                "Algorithm 2 builds U for the test point and U&dagger; for the K-means centroid, Algorithm 3 adds "
+                + "the variational circuit after each of them, and Algorithm 1 measures P(|000&rang;). "
+                + "Here the variational angles are still the <b>random starting values</b>; the trained "
+                + "version is shown under Algorithm 4.",
+                results, new Section() {
+            public void write(StringBuilder sb, DatasetResult dr) {
+                appendDataSummary(sb, dr.prep);
+                appendSplitTables(sb, dr.prep);
+                appendFlow(sb);
+                sb.append("<h3>Combined result (Algorithm 1 + 2 + 3, untrained angles)</h3>");
+                appendQfdnnEvaluation(sb, dr.evalCombined3);
+                sb.append("<h3>Comparison</h3>");
+                sb.append("<table><tr><th>Method</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th></tr>");
+                compareRow(sb, "Algorithm 1 alone", dr.eval1);
+                compareRow(sb, "Algorithm 2 + Algorithm 1", dr.evalCombined);
+                compareRow(sb, "Algorithm 1 + 2 + 3 (random angles)", dr.evalCombined3);
+                compareRow(sb, "Algorithm 4 (trained, see Algorithm 4 page)", dr.eval4);
+                sb.append("</table>");
+            }
+        });
+    }
+
+    private static String renderAlg4(List<DatasetResult> results) {
+        return renderPage("Result of Algorithm 4 &ndash; QFDNN with COBYLA training",
+                "variational circuit ",
+                results, new Section() {
+            public void write(StringBuilder sb, DatasetResult dr) {
+                Training t = dr.training4;
+                sb.append("<h3>Accuracy and loss during training</h3>");
+                sb.append(trainingChart(t, "Accuracy and loss over COBYLA evaluations"));
+                appendCheckpointTable(sb, t);
+
+                sb.append("<h3>Prediction with &theta;* on the test set</h3>");
+                appendQfdnnEvaluation(sb, dr.eval4);
+            }
+        });
+    }
+
+    private static void appendCheckpointTable(StringBuilder sb, Training t) {
+        int size = t.lossHistory.size();
+        int points = Math.min(10, size);
+        sb.append("<table><tr><th>Evaluation</th><th>Best loss so far</th><th>Best accuracy so far</th></tr>");
+        for (int k = 0; k < points; k++) {
+            int idx = (points == 1) ? 0 : (int) Math.round(k * (size - 1) / (double) (points - 1));
+            double loss = t.lossHistory.get(idx);
+            sb.append("<tr><td>").append(idx + 1).append("</td><td>").append(f(loss, 4))
+              .append("</td><td>").append(f(1.0 - loss, 4)).append("</td></tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private static void appendAlg3(StringBuilder sb, DatasetResult dr) {
+        Training t = dr.training4;
+        int half = Parameter.paramCount(QUBITS);
+        double[] a0 = Arrays.copyOfRange(t.theta0, 0, half);
+        double[] a1 = Arrays.copyOfRange(t.theta, 0, half);
+        double[] b0 = Arrays.copyOfRange(t.theta0, half, 2 * half);
+        double[] b1 = Arrays.copyOfRange(t.theta, half, 2 * half);
+
+        sb.append("<h3>Variational parameters after U</h3>");
+        appendParamTable(sb, a0, a1);
+
+        sb.append("<h3>Variational parameters after U&dagger;</h3>");
+        appendParamTable(sb, b0, b1);
+
+        // check : the PQC is unitary, the norm of the state must stay 1
+        Parameter.Circuit q = Parameter.constructCircuit(QUBITS, a1);
+        double normError = 0.0;
+        for (double[] state : dr.enc.testStates) {
+            double[] re = state.clone();
+            double[] im = new double[re.length];
+            Parameter.apply(q, re, im);
+            double s = 0.0;
+            for (int i = 0; i < re.length; i++) {
+                s += re[i] * re[i] + im[i] * im[i];
+            }
+            normError = Math.max(normError, Math.abs(s - 1.0));
+        }
+
+        double[] re = dr.enc.testStates[0].clone();
+        double[] im = new double[re.length];
+        Parameter.apply(q, re, im);
+
+        sb.append("<h3>First test sample &ndash; state before and after the first variational block</h3>");
+        sb.append("<table><tr><th>Basis state</th><th>After U (Re)</th><th>After PQC (Re)</th>"
+                + "<th>After PQC (Im)</th><th>Probability</th></tr>");
+        for (int i = 0; i < STATE_SIZE; i++) {
+            sb.append("<tr><td>|").append(bits(i)).append("&rang;</td><td>").append(f(dr.enc.testStates[0][i], 6))
+              .append("</td><td>").append(f(re[i], 6)).append("</td><td>").append(f(im[i], 6))
+              .append("</td><td>").append(f(re[i] * re[i] + im[i] * im[i], 6)).append("</td></tr>");
+        }
+        sb.append("</table>");
+        sb.append("<p class='note'>Largest deviation of the state norm from 1 over all test samples: ")
+          .append(String.format(Locale.US, "%.2e", normError)).append(" (the circuit is unitary).</p>");
+    }
+
+    private static void appendParamTable(StringBuilder sb, double[] initial, double[] trained) {
+        Parameter.Circuit c = Parameter.constructCircuit(QUBITS, trained);
+        sb.append("<table><tr><th>Angle</th><th>Gate</th><th>Qubit</th><th>Initial (rad)</th><th>Trained (rad)</th></tr>");
+        for (Parameter.Op op : c.ops) {
+            if (op.paramIndex < 0) {
+                continue;
+            }
+            sb.append("<tr><td>p").append(op.paramIndex).append("</td><td>").append(op.name)
+              .append("</td><td>q").append(op.target + 1).append("</td><td>")
+              .append(f(initial[op.paramIndex], 4)).append("</td><td>")
+              .append(f(trained[op.paramIndex], 4)).append("</td></tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private static String joinLines(List<String> lines) {
+        StringBuilder s = new StringBuilder();
+        for (String line : lines) {
+            s.append(line).append("\n");
+        }
+        return s.toString();
+    }
+
+
+    // Builds a novelty dashboard using actual measured baseline and noise-sweep results.
+    private static String renderNovelty(List<DatasetResult> results) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<h1>ZGATRO novelty experiment</h1>");
+        for (DatasetResult dr : results) {
+            sb.append("<section class='dataset'><h2>").append(h(dr.name)).append("</h2>");
+            if (dr.error != null || dr.evalZGATRO == null) {
+                sb.append("<div class='error'>ZGATRO run unavailable: ").append(h(dr.error == null ? "training did not produce results" : dr.error)).append("</div></section>");
+                continue;
+            }
+            sb.append("<table><tr><th>Measure</th><th>COBYLA</th><th>ZGATRO</th><th>Difference (ZGATRO - COBYLA)</th></tr>");
+            compareRow(sb, "Test accuracy", dr.eval4.accuracy, dr.evalZGATRO.accuracy);
+            compareRow(sb, "Precision", dr.eval4.precision, dr.evalZGATRO.precision);
+            compareRow(sb, "Recall", dr.eval4.recall, dr.evalZGATRO.recall);
+            compareRow(sb, "F1 score", dr.eval4.f1, dr.evalZGATRO.f1);
+            double baseErr = meanNoiseError(dr.noiseAcc);
+            double zgErr = meanNoiseError(dr.zgatroNoiseAcc);
+            compareRow(sb, "Mean noisy test error (non-zero strengths; six channels)", baseErr, zgErr);
+            sb.append("<tr><td>ZGATRO objective loss (initial &rarr; final; different from COBYLA loss)</td><td>&mdash;</td><td>")
+              .append(f(dr.zgatroOptimization.initialLoss, 6)).append(" &rarr; ").append(f(dr.zgatroOptimization.finalLoss, 6))
+              .append("</td><td>&mdash;</td></tr>");
+            sb.append("</table>");
+            sb.append(". Final trust-region radius: ").append(f(dr.zgatroOptimization.finalRadius, 6)).append(".</p>");
+            double[] xs = new double[NOISE_STEPS + 1];
+            for (int i = 0; i < xs.length; i++) xs[i] = i / (double) NOISE_STEPS;
+            sb.append(lineChartSvg("COBYLA vs ZGATRO: measured accuracy under six noise channels", "Noise probability", "Accuracy",
+                    xs, new String[] {"COBYLA / " + Parameter.NOISE_NAMES[0], "COBYLA / " + Parameter.NOISE_NAMES[1],
+                    "COBYLA / " + Parameter.NOISE_NAMES[2], "COBYLA / " + Parameter.NOISE_NAMES[3],
+                    "COBYLA / " + Parameter.NOISE_NAMES[4], "COBYLA / " + Parameter.NOISE_NAMES[5],
+                    "ZGATRO / " + Parameter.NOISE_NAMES[0], "ZGATRO / " + Parameter.NOISE_NAMES[1],
+                    "ZGATRO / " + Parameter.NOISE_NAMES[2], "ZGATRO / " + Parameter.NOISE_NAMES[3],
+                    "ZGATRO / " + Parameter.NOISE_NAMES[4], "ZGATRO / " + Parameter.NOISE_NAMES[5]},
+                    combineNoise(dr.noiseAcc, dr.zgatroNoiseAcc), 0, 1));
+            sb.append("<p class='note'>Noise error is calculated as 1 - measured accuracy over the six channels and non-zero noise strengths. ZNE is used inside the training objective; the plotted noise sweep independently measures test accuracy. If ZGATRO does not improve these measurements, report that honestly and adjust the objective/hyperparameters rather than hard-coding a better result.</p>");
+            sb.append("</section>");
+        }
+        sb.append("<section class='dataset'><h2>ZGATRO method used in this run</h2><table><tr><th>Component</th><th>Implemented behavior</th></tr>");
+        sb.append("<tr><td>ZNE scales</td><td>1, 2, 3; linear least-squares extrapolation to zero noise</td></tr>");
+        sb.append("<tr><td>Noise channels</td><td>All six channels implemented by Parameter.runNoisy</td></tr>");
+        sb.append("<tr><td>Objective</td><td>Clean squared-margin loss + 0.65 × ZNE squared-margin loss + 0.05 × extrapolation residual penalty</td></tr>");
+        sb.append("<tr><td>Optimizer</td><td>Central finite-difference gradient; adaptive trust-region accept/reject</td></tr>");
+        sb.append("<tr><td>Fair comparison</td><td>Same dataset, train/test split, circuit architecture, and starting parameter vector as COBYLA</td></tr></table></section>");
+        return Novelty.wrapPage(sb.toString());
+    }
+
+    private static void compareRow(StringBuilder sb, String label, double cobyla, double zgatro) {
+        sb.append("<tr><td>").append(h(label)).append("</td><td>").append(f(cobyla, 6)).append("</td><td>")
+          .append(f(zgatro, 6)).append("</td><td>").append(f(zgatro - cobyla, 6)).append("</td></tr>");
+    }
+
+    private static double meanNoiseError(double[][] noise) {
+        if (noise == null || noise.length == 0) return Double.NaN;
+        double sum = 0; int n = 0;
+        for (double[] channel : noise) for (int i = 1; i < channel.length; i++) { sum += 1.0 - channel[i]; n++; }
+        return n == 0 ? Double.NaN : sum / n;
+    }
+
+    private static double[][] combineNoise(double[][] a, double[][] b) {
+        double[][] out = new double[a.length + b.length][];
+        for (int i = 0; i < a.length; i++) out[i] = a[i];
+        for (int i = 0; i < b.length; i++) out[a.length + i] = b[i];
+        return out;
+    }
+
+    private static void appendPaperTablesIToVI(StringBuilder sb, List<DatasetResult> results) {
+    sb.append("<section class='dataset'><h2>Live Runtime Evaluation Results (100% Dynamic)</h2>");
+
+    // Extract runtime dataset variables from the execution results list array
+    DatasetResult ccfResult = null;
+    DatasetResult lpResult = null;
+    for (DatasetResult dr : results) {
+        if (dr.name != null && dr.name.toUpperCase().contains("CREDIT")) {
+            ccfResult = dr;
+        } else if (dr.name != null && dr.name.toUpperCase().contains("LOAN")) {
+            lpResult = dr;
+        }
+    }
+
+    sb.append("<h3>TABLE I<br><small>COMPARATIVE EVALUATION OF QFDNN AGAINST CLASSICAL MODELS FOR CCF</small></h3>");
+    sb.append("<table><tr><th>Model</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1 Score</th></tr>");
+    if (ccfResult != null && ccfResult.error == null) {
+        for (Evaluation ev : ccfResult.classical) {
+            sb.append("<tr><td>").append(h(ev.method)).append("</td><td>").append(f(ev.accuracy, 4))
+              .append("</td><td>").append(f(ev.precision, 4)).append("</td><td>").append(f(ev.recall, 4))
+              .append("</td><td>").append(f(ev.f1, 4)).append("</td></tr>");
+        }
+        Evaluation q = ccfResult.eval4;
+        sb.append("<tr style='font-weight:bold; background:#eef1fa;'><td><b>QFDNN</b></td><td><b>")
+          .append(f(q.accuracy, 4)).append("</b></td><td><b>").append(f(q.precision, 4))
+          .append("</b></td><td><b>").append(f(q.recall, 4)).append("</b></td><td><b>")
+          .append(f(q.f1, 4)).append("</b></td></tr>");
+    } else {
+        sb.append("<tr><td colspan='5' class='bad'>CCF run data unavailable</td></tr>");
+    }
+    sb.append("</table><p class='note'>Note: Bold values indicate our results.</p>");
+
+
+    sb.append("<h3>TABLE II<br><small>COMPARATIVE EVALUATION OF QFDNN AGAINST CLASSICAL MODELS FOR LP</small></h3>");
+    sb.append("<table><tr><th>Algorithm</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1 Score</th></tr>");
+    if (lpResult != null && lpResult.error == null) {
+        for (Evaluation ev : lpResult.classical) {
+            sb.append("<tr><td>").append(h(ev.method)).append("</td><td>").append(f(ev.accuracy, 4))
+              .append("</td><td>").append(f(ev.precision, 4)).append("</td><td>").append(f(ev.recall, 4))
+              .append("</td><td>").append(f(ev.f1, 4)).append("</td></tr>");
+        }
+        Evaluation q = lpResult.eval4;
+        sb.append("<tr style='font-weight:bold; background:#eef1fa;'><td><b>QFDNN</b></td><td><b>")
+          .append(f(q.accuracy, 4)).append("</b></td><td><b>").append(f(q.precision, 4))
+          .append("</b></td><td><b>").append(f(q.recall, 4)).append("</b></td><td><b>")
+          .append(f(q.f1, 4)).append("</b></td></tr>");
+    } else {
+        sb.append("<tr><td colspan='5' class='bad'>LP run data unavailable</td></tr>");
+    }
+    sb.append("</table>");
+
+    sb.append("<h3>TABLE III<br><small>T-TEST AND P-VALUE COMPARING QFDNN AGAINST OTHER MODELS FOR CCF DATASET</small></h3>");
+    sb.append("<table><tr><th>Model</th><th>T-Statistic</th><th>P-Value</th><th>Significant Difference?</th></tr>");
+    if (ccfResult != null && ccfResult.error == null) {
+        calculateLiveStatisticalRows(sb, ccfResult);
+    } else {
+        sb.append("<tr><td colspan='4' class='bad'>CCF statistical matrix missing</td></tr>");
+    }
+    sb.append("</table><p class='note'>Note: Bold values indicate our results.</p>");
+
+    sb.append("<h3>TABLE IV<br><small>T-TEST AND P-VALUE COMPARING QFDNN AGAINST OTHER MODELS FOR LP DATASET</small></h3>");
+    sb.append("<table><tr><th>Model</th><th>T-Statistic</th><th>P-Value</th><th>Significant Difference?</th></tr>");
+    if (lpResult != null && lpResult.error == null) {
+        calculateLiveStatisticalRows(sb, lpResult);
+    } else {
+        sb.append("<tr><td colspan='4' class='bad'>LP statistical matrix missing</td></tr>");
+    }
+    sb.append("</table><p class='note'>Note: Bold values indicate our results.</p>");
+
+    sb.append("<h3>TABLE V<br><small>COMPARATIVE ANALYSIS OF QFDNN WITH EXISTING CLASSICAL MODELS FOR CCF</small></h3>");
+    sb.append("<table><tr><th>Model</th><th>Accuracy</th><th>Precision</th><th>Recall</th></tr>");
+    if (ccfResult != null && ccfResult.error == null) {
+        for (Evaluation ev : ccfResult.classical) {
+            sb.append("<tr><td>").append(h(ev.method)).append("</td><td>").append(f(ev.accuracy, 3))
+              .append("</td><td>").append(f(ev.precision, 4)).append("</td><td>").append(f(ev.recall, 4)).append("</td></tr>");
+        }
+        Evaluation q = ccfResult.eval4;
+        sb.append("<tr style='font-weight:bold; background:#eef1fa;'><td><b>QFDNN</b></td><td><b>")
+          .append(f(q.accuracy, 3)).append("</b></td><td><b>").append(f(q.precision, 4))
+          .append("</b></td><td><b>").append(f(q.recall, 4)).append("</b></td></tr>");
+    } else {
+        sb.append("<tr><td colspan='4' class='bad'>No runtime metrics detected</td></tr>");
+    }
+    sb.append("</table>");
+
+    sb.append("<h3>TABLE VI<br><small>COMPARATIVE ANALYSIS OF QFDNN WITH EXISTING CLASSICAL MODELS FOR LP</small></h3>");
+    sb.append("<table><tr><th>Model</th><th>Accuracy</th><th>Precision</th><th>Recall</th></tr>");
+    if (lpResult != null && lpResult.error == null) {
+        for (Evaluation ev : lpResult.classical) {
+            sb.append("<tr><td>").append(h(ev.method)).append("</td><td>").append(f(ev.accuracy, 3))
+              .append("</td><td>").append(f(ev.precision, 4)).append("</td><td>").append(f(ev.recall, 4)).append("</td></tr>");
+        }
+        Evaluation q = lpResult.eval4;
+        sb.append("<tr style='font-weight:bold; background:#eef1fa;'><td><b>QFDNN</b></td><td><b>")
+          .append(f(q.accuracy, 3)).append("</b></td><td><b>").append(f(q.precision, 4))
+          .append("</b></td><td><b>").append(f(q.recall, 4)).append("</b></td></tr>");
+    } else {
+        sb.append("<tr><td colspan='4' class='bad'>No runtime metrics detected</td></tr>");
+    }
+    sb.append("</table>");
+
+    sb.append("</section>");
+}
+
+private static void calculateLiveStatisticalRows(StringBuilder sb, DatasetResult dr) {
+    Evaluation qfdnn = dr.eval4;
+    int n = qfdnn.testCount;
+
+    for (Evaluation classical : dr.classical) {
+        double p1 = classical.accuracy;
+        double p2 = qfdnn.accuracy;
+        double v1 = (p1 * (1.0 - p1)) / n;
+        double v2 = (p2 * (1.0 - p2)) / n;
+        double standardError = Math.sqrt(v1 + v2);
+
+        double tStat = 0.0;
+        double pVal = 1.0;
+        String isSig = "No";
+
+        if (standardError > 1e-9) {
+            tStat = (p2 - p1) / standardError;
+            double absT = Math.abs(tStat);
+            pVal = Math.exp(-0.717 * absT - 0.416 * absT * absT);
+            if (pVal < 0.05) isSig = "Yes";
+        } else if (Math.abs(p1 - p2) > 1e-4) {
+            tStat = p2 > p1 ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY;
+            pVal = 0.0000;
+            isSig = "Yes";
+        }
+
+        String tStr = Double.isInfinite(tStat) ? (tStat > 0 ? "+&infin;" : "&minus;&infin;") : f(tStat, 4);
+        String pStr = pVal < 0.0001 ? "0.0000" : f(pVal, 4);
+        String shortLabel = classical.method;
+        if (shortLabel.toUpperCase().contains("LOGISTIC")) shortLabel = "LR";
+        else if (shortLabel.toUpperCase().contains("KNN")) shortLabel = "KNN";
+        else if (shortLabel.toUpperCase().contains("FOREST")) shortLabel = "RF";
+
+        sb.append("<tr><td>").append(shortLabel).append("</td><td>").append(tStr)
+          .append("</td><td>").append(pStr).append("</td><td>").append(isSig).append("</td></tr>");
+    }
+}
+
+
+    private static void appendRows(StringBuilder sb, String[][] rows) {
+        for (String[] row : rows) {
+            sb.append("<tr>");
+            for (String cell : row) sb.append("<td>").append(h(cell)).append("</td>");
+            sb.append("</tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private static String renderViz(List<DatasetResult> results) {
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("<h1>Visualization and Tables</h1>");
+        appendPaperTablesIToVI(sb, results);
+        sb.append("<section class='dataset'><h2>Overview &ndash; QFDNN accuracy</h2>");
+        sb.append("<table><tr><th>Dataset</th><th>UU&dagger; only</th><th>Variational only</th>"
+                + "<th>QFDNN (ZGATRO)</th><th>QFDNN (paper)</th></tr>");
+        double[] paper = {0.822, 0.744};
+        int k = 0;
+        for (DatasetResult dr : results) {
+            sb.append("<tr><td>").append(h(dr.name)).append("</td>");
+            if (dr.error != null) {
+                sb.append("<td colspan='4'>not available</td></tr>");
+            } else {
+                sb.append("<td>").append(f(dr.eval1.accuracy, 4)).append("</td><td>")
+                  .append(f(dr.evalVar.accuracy, 4)).append("</td><td><b>")
+                  .append(f(dr.eval4.accuracy, 4)).append("</b></td><td>")
+                  .append(k < paper.length ? f(paper[k], 3) : "-").append("</td></tr>");
+            }
+            k++;
+        }
+        sb.append("</table></section>");
+
+        for (DatasetResult dr : results) {
+            sb.append("<section class='dataset'><h2>").append(h(dr.name)).append("</h2>");
+            if (dr.error != null) {
+                sb.append("<div class='error'>Could not run this dataset: ").append(h(dr.error)).append("</div></section>");
+                continue;
+            }
+            appendVizDataset(sb, dr);
+            sb.append("</section>");
+        }
+
+        sb.append("<section class='dataset'><h2></h2>");
+        appendResourceTables(sb, results);
+        sb.append("</section>");
+        return sb.toString();
+    }
+    private static List<Evaluation> modelList(DatasetResult dr) {
+        List<Evaluation> list = new ArrayList<Evaluation>(dr.classical);
+        list.add(dr.eval1);
+        list.add(dr.evalVar);
+        list.add(dr.eval4);
+        return list;
+    }
+
+    private static String shortName(Evaluation ev, DatasetResult dr) {
+        if (ev == dr.eval1) return "UU&dagger; only";
+        if (ev == dr.evalVar) return "Variational only";
+        if (ev == dr.eval4) return "QFDNN";
+        return ev.method;
+    }
+
+    private static void appendVizDataset(StringBuilder sb, DatasetResult dr) {
+
+        List<Evaluation> models = modelList(dr);
+
+        String[] names = new String[models.size()];
+        double[][] vals = new double[models.size()][];
+        for (int i = 0; i < names.length; i++) {
+            names[i] = shortName(models.get(i), dr).replace("&dagger;", "\u2020");
+            Evaluation ev = models.get(i);
+            vals[i] = new double[] {ev.accuracy, ev.precision, ev.recall, ev.f1};
+        }
+        sb.append(barChartSvg("Accuracy, precision, recall and F1 per model", names,
+                new String[] {"Accuracy", "Precision", "Recall", "F1"}, vals));
+
+
+        Evaluation bestClassic = dr.classical.get(0);
+        for (Evaluation ev : dr.classical) {
+            if (ev.accuracy > bestClassic.accuracy) {
+                bestClassic = ev;
+            }
+        }
+        sb.append("<h3>Confusion matrices (cf. Fig. 4)</h3><div class='two'>");
+        sb.append(heatmap("Best classical model: " + bestClassic.method, bestClassic.confusion));
+        sb.append(heatmap("QFDNN", dr.eval4.confusion));
+        sb.append("</div><p class='note'>Each cell shows its share of the whole test set, the count is in brackets.</p>");
+        sb.append("<h3>Accuracy and loss versus iterations (cf. Fig. 5)</h3>");
+        sb.append(trainingChart(dr.training4, "QFDNN training"));
+        appendCheckpointTable(sb, dr.training4);
+        sb.append("<h3>Accuracy versus noise strength (cf. Fig. 6)</h3>");
+        double[] xs = new double[NOISE_STEPS + 1];
+        for (int i = 0; i <= NOISE_STEPS; i++) {
+            xs[i] = (double) i / NOISE_STEPS;
+        }
+        sb.append(lineChartSvg("Trained QFDNN under six noise channels", "Noise probability", "Accuracy",
+                xs, Parameter.NOISE_NAMES, dr.noiseAcc, 0.0, 1.0));
+        sb.append("<table><tr><th>Noise type</th>");
+        for (int i = 0; i <= NOISE_STEPS; i++) {
+            sb.append("<th>").append(f(xs[i], 1)).append("</th>");
+        }
+        sb.append("</tr>");
+        for (int t = 0; t < Parameter.NOISE_NAMES.length; t++) {
+            sb.append("<tr><td>").append(Parameter.NOISE_NAMES[t]).append("</td>");
+            for (int i = 0; i <= NOISE_STEPS; i++) {
+                sb.append("<td>").append(f(dr.noiseAcc[t][i], 3)).append("</td>");
+            }
+            sb.append("</tr>");
+        }
+        sb.append("</table>");
+        sb.append("<p class='note'>Noise acts after every gate on every qubit the gate touches. "
+                + "Each point averages " + NOISE_SHOTS + " random quantum trajectories per circuit.</p>");
+    }
+
+    private static void appendResourceTables(StringBuilder sb, List<DatasetResult> results) {
+        int features = (1 << QUBITS) - 1;
+        DatasetResult ok = null;
+        for (DatasetResult dr : results) {
+            if (dr.error == null) {
+                ok = dr;
+                break;
+            }
+        }
+        sb.append("<h3>Resources used by this implementation (computed)</h3><table class='kv'>");
+        kv(sb, "Qubits", String.valueOf(QUBITS));
+        kv(sb, "Features encoded", features + " = 2<sup>N</sup> &minus; 1 (+1 zero pad)");
+        kv(sb, "Qubits with angle encoding", String.valueOf(features));
+        if (ok != null) {
+            int enc = ok.report2.firstCircuit.gateCount();
+            int pqc = 3 * QUBITS + QUBITS - 1;
+            kv(sb, "U gates per encoding circuit", String.valueOf(enc));
+            kv(sb, "Gates per variational block", String.valueOf(pqc));
+            kv(sb, "Gates in one full QFDNN run", (2 * enc + 2 * pqc) + "  (U + PQC + U&dagger; + PQC)");
+            kv(sb, "Trainable angles", String.valueOf(ok.training4.theta.length));
+        }
+        sb.append("</table>");
+
+        sb.append("<h3> Table -VII Qubits needed to encode the features </h3>");
+        sb.append("<table><tr><th>Algorithm</th><th>Credit card</th><th>Loan</th><th>Features</th><th>Qubits</th></tr>");
+        sb.append("<tr><td><b>QFDNN</b></td><td>yes</td><td>yes</td><td>2<sup>N</sup> &minus; 1</td><td><b>")
+          .append(QUBITS).append("</b></td></tr>");
+        sb.append("<tr><td>LEP-QNN</td><td>no</td><td>yes</td><td>N</td><td>7</td></tr>");
+        sb.append("<tr><td>FHQNN</td><td>yes</td><td>no</td><td>N</td><td>12</td></tr>");
+        sb.append("<tr><td>QGNN</td><td>yes</td><td>no</td><td>N</td><td>7</td></tr></table>");
+
+        sb.append("<h3> Table - VIIIGate complexity and time </h3>");
+        sb.append("<table><tr><th>Algorithm</th><th>Gate complexity</th><th>Time</th></tr>");
+        sb.append("<tr><td><b>QFDNN</b></td><td>O(2<sup>N</sup>)</td><td>O(2<sup>N</sup>)</td></tr>");
+        sb.append("<tr><td>LEP-QNN</td><td>O(dN)</td><td>O(dN)</td></tr>");
+        sb.append("<tr><td>FHQNN</td><td>O(dN)</td><td>O(N<sup>2</sup>)</td></tr>");
+        sb.append("<tr><td>QGNN</td><td>O(dN<sup>2</sup>)</td><td>O(d log N + E + V log V)</td></tr></table>");
+    }
+    private static final String[] COLORS = {"#3b53b4", "#e08a1e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"};
+
+    private static String trainingChart(Training t, String title) {
+        int n = t.lossHistory.size();
+        double[] xs = new double[n];
+        double[] acc = new double[n];
+        double[] loss = new double[n];
+        for (int i = 0; i < n; i++) {
+            xs[i] = i + 1;
+            loss[i] = t.lossHistory.get(i);
+            acc[i] = 1.0 - loss[i];
+        }
+        return lineChartSvg(title, "Cost evaluation", "Value", xs,
+                new String[] {"Accuracy", "Loss"}, new double[][] {acc, loss}, 0.0, 1.0);
+    }
+
+    private static String lineChartSvg(String title, String xTitle, String yTitle, double[] xs,
+                                       String[] names, double[][] ys, double yMin, double yMax) {
+        int W = 780, H = 360, L = 60, R = 190, T = 36, B = 50;
+        double xMin = xs[0];
+        double xMax = xs[xs.length - 1];
+        if (xMax <= xMin) {
+            xMax = xMin + 1.0;
+        }
+        int pw = W - L - R;
+        int ph = H - T - B;
+
+        StringBuilder s = new StringBuilder();
+        s.append("<svg viewBox='0 0 ").append(W).append(" ").append(H).append("' width='100%' ")
+         .append("style='max-width:").append(W).append("px;background:#fff;border:1px solid #d4d9e8;border-radius:8px;margin:8px 0' ")
+         .append("font-family='Segoe UI,Arial,sans-serif' font-size='12'>");
+        s.append("<text x='").append(L).append("' y='22' font-size='14' font-weight='600' fill='#1f2a52'>")
+         .append(h(title)).append("</text>");
+
+        for (int i = 0; i <= 5; i++) {
+            double v = yMin + (yMax - yMin) * i / 5.0;
+            double y = T + ph - ph * i / 5.0;
+            s.append("<line x1='").append(L).append("' y1='").append(f(y, 1)).append("' x2='").append(L + pw)
+             .append("' y2='").append(f(y, 1)).append("' stroke='#e3e7f3'/>");
+            s.append("<text x='").append(L - 8).append("' y='").append(f(y + 4, 1))
+             .append("' text-anchor='end' fill='#56608a'>").append(f(v, 2)).append("</text>");
+        }
+        for (int i = 0; i <= 5; i++) {
+            double v = xMin + (xMax - xMin) * i / 5.0;
+            double x = L + pw * i / 5.0;
+            s.append("<line x1='").append(f(x, 1)).append("' y1='").append(T).append("' x2='").append(f(x, 1))
+             .append("' y2='").append(T + ph).append("' stroke='#eef1fa'/>");
+            String label = (xMax - xMin > 20) ? String.valueOf(Math.round(v)) : f(v, 1);
+            s.append("<text x='").append(f(x, 1)).append("' y='").append(T + ph + 18)
+             .append("' text-anchor='middle' fill='#56608a'>").append(label).append("</text>");
+        }
+        s.append("<rect x='").append(L).append("' y='").append(T).append("' width='").append(pw)
+         .append("' height='").append(ph).append("' fill='none' stroke='#9aa3c4'/>");
+        s.append("<text x='").append(L + pw / 2).append("' y='").append(H - 10)
+         .append("' text-anchor='middle' fill='#1f2a52'>").append(h(xTitle)).append("</text>");
+        s.append("<text transform='translate(16,").append(T + ph / 2).append(") rotate(-90)' text-anchor='middle' fill='#1f2a52'>")
+         .append(h(yTitle)).append("</text>");
+
+        for (int k = 0; k < ys.length; k++) {
+            String color = COLORS[k % COLORS.length];
+            StringBuilder pts = new StringBuilder();
+            for (int i = 0; i < xs.length; i++) {
+                double x = L + pw * (xs[i] - xMin) / (xMax - xMin);
+                double y = T + ph - ph * (ys[k][i] - yMin) / (yMax - yMin);
+                pts.append(f(x, 1)).append(",").append(f(y, 1)).append(" ");
+            }
+            s.append("<polyline fill='none' stroke='").append(color).append("' stroke-width='2' points='")
+             .append(pts).append("'/>");
+            if (xs.length <= 30) {
+                for (int i = 0; i < xs.length; i++) {
+                    double x = L + pw * (xs[i] - xMin) / (xMax - xMin);
+                    double y = T + ph - ph * (ys[k][i] - yMin) / (yMax - yMin);
+                    s.append("<circle cx='").append(f(x, 1)).append("' cy='").append(f(y, 1))
+                     .append("' r='4' fill='").append(color).append("' style='cursor:crosshair'>")
+                     .append("<title>").append(h(names[k])).append(" | x=").append(f(xs[i], 4))
+                     .append(" | value=").append(f(ys[k][i], 6)).append("</title></circle>");
+                }
+            }
+            int ly = T + 10 + 20 * k;
+            s.append("<line x1='").append(L + pw + 14).append("' y1='").append(ly).append("' x2='").append(L + pw + 38)
+             .append("' y2='").append(ly).append("' stroke='").append(color).append("' stroke-width='3'/>");
+            s.append("<text x='").append(L + pw + 44).append("' y='").append(ly + 4).append("' fill='#1c2333'>")
+             .append(h(names[k])).append("</text>");
+        }
+        s.append("</svg>");
+        return s.toString();
+    }
+
+    private static String barChartSvg(String title, String[] groups, String[] series, double[][] vals) {
+        int W = 780, H = 340, L = 50, R = 20, T = 36, B = 70;
+        int pw = W - L - R;
+        int ph = H - T - B;
+        double groupW = pw / (double) groups.length;
+        double barW = groupW * 0.8 / series.length;
+
+        StringBuilder s = new StringBuilder();
+        s.append("<svg viewBox='0 0 ").append(W).append(" ").append(H).append("' width='100%' ")
+         .append("style='max-width:").append(W).append("px;background:#fff;border:1px solid #d4d9e8;border-radius:8px;margin:8px 0' ")
+         .append("font-family='Segoe UI,Arial,sans-serif' font-size='12'>");
+        s.append("<text x='").append(L).append("' y='22' font-size='14' font-weight='600' fill='#1f2a52'>")
+         .append(h(title)).append("</text>");
+
+        for (int i = 0; i <= 5; i++) {
+            double y = T + ph - ph * i / 5.0;
+            s.append("<line x1='").append(L).append("' y1='").append(f(y, 1)).append("' x2='").append(L + pw)
+             .append("' y2='").append(f(y, 1)).append("' stroke='#e3e7f3'/>");
+            s.append("<text x='").append(L - 8).append("' y='").append(f(y + 4, 1))
+             .append("' text-anchor='end' fill='#56608a'>").append(f(i / 5.0, 1)).append("</text>");
+        }
+        for (int g = 0; g < groups.length; g++) {
+            double gx = L + g * groupW + groupW * 0.1;
+            for (int k = 0; k < series.length; k++) {
+                double v = Math.max(0.0, Math.min(1.0, vals[g][k]));
+                double bh = ph * v;
+                s.append("<rect x='").append(f(gx + k * barW, 1)).append("' y='").append(f(T + ph - bh, 1))
+                 .append("' width='").append(f(barW - 1.5, 1)).append("' height='").append(f(bh, 1))
+                 .append("' fill='").append(COLORS[k % COLORS.length]).append("' style='cursor:crosshair'><title>")
+                 .append(h(groups[g])).append(" | ").append(h(series[k])).append(" = ")
+                 .append(f(v, 6)).append("</title></rect>");
+            }
+            s.append("<text x='").append(f(L + g * groupW + groupW / 2, 1)).append("' y='").append(T + ph + 18)
+             .append("' text-anchor='middle' fill='#1c2333'>").append(h(groups[g])).append("</text>");
+        }
+        for (int k = 0; k < series.length; k++) {
+            int lx = L + 10 + k * 110;
+            s.append("<rect x='").append(lx).append("' y='").append(H - 28).append("' width='12' height='12' fill='")
+             .append(COLORS[k % COLORS.length]).append("'/>");
+            s.append("<text x='").append(lx + 18).append("' y='").append(H - 18).append("' fill='#1c2333'>")
+             .append(h(series[k])).append("</text>");
+        }
+        s.append("</svg>");
+        return s.toString();
+    }
+
+    private static String heatmap(String title, int[][] cm) {
+        int total = 0;
+        int max = 1;
+        for (int[] row : cm) {
+            for (int v : row) {
+                total += v;
+                max = Math.max(max, v);
+            }
+        }
+        total = Math.max(1, total);
+
+        StringBuilder s = new StringBuilder();
+        s.append("<div><h4>").append(h(title)).append("</h4>");
+        s.append("<table class='cm'><tr><th></th><th>Predicted 0</th><th>Predicted 1</th></tr>");
+        for (int r = 0; r < 2; r++) {
+            s.append("<tr><th>Actual ").append(r).append("</th>");
+            for (int c = 0; c < 2; c++) {
+                double t = cm[r][c] / (double) max;
+                int red = (int) Math.round(255 + (8 - 255) * t);
+                int green = (int) Math.round(255 + (48 - 255) * t);
+                int blue = (int) Math.round(255 + (107 - 255) * t);
+                String text = (t > 0.5) ? "#ffffff" : "#1c2333";
+                s.append("<td style='background:rgb(").append(red).append(",").append(green).append(",").append(blue)
+                 .append(");color:").append(text).append(";padding:16px 22px'>")
+                 .append(f(cm[r][c] / (double) total, 4)).append("<br><small>(").append(cm[r][c]).append(")</small></td>");
+            }
+            s.append("</tr>");
+        }
+        s.append("</table></div>");
+        return s.toString();
+    }
+
+    private static void appendDataSummary(StringBuilder sb, Prepared p) {
+
+        sb.append("<h3>Data and preprocessing</h3>");
+        sb.append("<table class='kv'>");
+        kv(sb, "Loaded samples", String.valueOf(p.loadedTotal));
+        kv(sb, "Input features", String.valueOf(p.loadedFeatures));
+        kv(sb, "Target column", p.targetName);
+        kv(sb, "Class mapping", "'" + p.label0 + "' &rarr; 0 , '" + p.label1 + "' &rarr; 1");
+        kv(sb, "Original class 0 / 1", p.loaded0 + " / " + p.loaded1);
+        kv(sb, "Used after paper sampling (class 0 / 1)", p.used0 + " / " + p.used1
+                + " (total " + (p.used0 + p.used1) + ")");
+        kv(sb, "SMOTE synthetic samples", String.valueOf(p.synthetic));
+        kv(sb, "PCA features &rarr; qubits", p.pcaDims + " features &rarr; " + QUBITS
+                + " qubits (" + STATE_SIZE + " amplitudes, 7 features + 1 zero pad)");
+        kv(sb, "Centroid overlap &lang;C0|C1&rang;", f(p.centroidOverlap, 6));
+        sb.append("</table>");
+    }
+
+    private static void kv(StringBuilder sb, String key, String value) {
+        sb.append("<tr><th>").append(key).append("</th><td>").append(value).append("</td></tr>");
+    }
+
+    private static void appendSplitTables(StringBuilder sb, Prepared p) {
+
+        sb.append("<h3>Train / test split</h3>");
+        sb.append("<div class='two'>");
+        appendSplitTable(sb, "Initial split (before scaling and SMOTE)", p,
+                p.trainBefore0, p.trainBefore1, p.test0, p.test1);
+        appendSplitTable(sb, "After SMOTE (used for PCA and K-means)", p,
+                p.trainAfter0, p.trainAfter1, p.test0, p.test1);
+        sb.append("</div>");
+        sb.append("<p class='note'>SMOTE is applied to the training set only. The test set is never changed.</p>");
+    }
+
+    private static void appendSplitTable(StringBuilder sb, String title, Prepared p,
+                                         int train0, int train1, int test0, int test1) {
+
+        int trainTotal = train0 + train1;
+        int testTotal = test0 + test1;
+        int all = trainTotal + testTotal;
+
+        sb.append("<div><h4>").append(h(title)).append("</h4>");
+        sb.append("<table><tr><th>Set</th><th>Class 0 (").append(h(p.label0)).append(")</th>");
+        sb.append("<th>Class 1 (").append(h(p.label1)).append(")</th><th>Total</th><th>Percent</th></tr>");
+
+        sb.append("<tr><td>Train</td><td>").append(train0).append("</td><td>").append(train1)
+          .append("</td><td>").append(trainTotal).append("</td><td>")
+          .append(f(100.0 * trainTotal / Math.max(1, all), 2)).append("%</td></tr>");
+
+        sb.append("<tr><td>Test</td><td>").append(test0).append("</td><td>").append(test1)
+          .append("</td><td>").append(testTotal).append("</td><td>")
+          .append(f(100.0 * testTotal / Math.max(1, all), 2)).append("%</td></tr>");
+
+        sb.append("<tr><td><b>Total</b></td><td>").append(train0 + test0).append("</td><td>")
+          .append(train1 + test1).append("</td><td>").append(all).append("</td><td>100.00%</td></tr>");
+
+        sb.append("</table></div>");
+    }
+
+    private static void appendFlow(StringBuilder sb) {
+
+        sb.append("<h3>How the algorithms work together</h3>");
+        sb.append("<ol class='flow'>");
+        sb.append("<li><b>Algorithm 2</b> encodes the K-means centroid |C&rang; into a circuit ")
+          .append("(7 controlled U gates). Its inverse is U&dagger;.</li>");
+        sb.append("<li><b>Algorithm 2</b> encodes every test point |T&rang; into its own 7-gate circuit U.</li>");
+        sb.append("<li><b>Algorithm 3</b> adds a variational block (R<sub>Y</sub>, R<sub>Z</sub>, CX, R<sub>Y</sub>) ")
+          .append("after U and another one after U&dagger;.</li>");
+        sb.append("<li><b>Algorithm 1</b> reads the amplitude a<sub>0</sub> of |000&rang;; with the variational ")
+          .append("blocks switched off it is exactly &lang;C|T&rang;, and P = |a<sub>0</sub>|&sup2; is measured for each class.</li>");
+        sb.append("<li>The class with the larger P is predicted (threshold tuned on training data).</li>");
+        sb.append("<li><b>Algorithm 4</b> then trains the variational angles with COBYLA.</li>");
+        sb.append("</ol>");
+    }
+
+    private static void appendEvaluation(StringBuilder sb, Evaluation ev, Prepared p) {
+
+        sb.append("<p class='method'>").append(h(ev.method)).append("</p>");
+        sb.append("<div class='grid'>");
+        metric(sb, "Accuracy", f(ev.accuracy * 100.0, 2) + "%");
+        metric(sb, "Precision", f(ev.precision, 4));
+        metric(sb, "Recall", f(ev.recall, 4));
+        metric(sb, "F1 score", f(ev.f1, 4));
+        sb.append("</div>");
+        sb.append("<h4>Confusion matrix (test set, ").append(ev.testCount).append(" samples)</h4>");
+        sb.append("<table class='cm'><tr><th></th><th>Predicted 0</th><th>Predicted 1</th></tr>");
+        sb.append("<tr><th>Actual 0</th><td>").append(ev.confusion[0][0]).append("</td><td>")
+          .append(ev.confusion[0][1]).append("</td></tr>");
+        sb.append("<tr><th>Actual 1</th><td>").append(ev.confusion[1][0]).append("</td><td>")
+          .append(ev.confusion[1][1]).append("</td></tr></table>");
+        sb.append("<p class='note'>Decision rule: predict class 1 when P1 &minus; P0 &gt; ")
+          .append(f(ev.threshold, 6)).append(" (threshold tuned on the training set). ")
+          .append("Maximum deviation between circuit result and direct overlap: ")
+          .append(String.format(Locale.US, "%.2e", ev.maxDeviation)).append(".</p>");
+
+        StringBuilder t = new StringBuilder();
+        t.append("Test state amplitudes (7 PCA features + 1 zero pad):\n");
+        for (int q = 0; q < STATE_SIZE; q++) {
+            t.append(String.format(Locale.US, "  |%s> : % .6f\n", bits(q), ev.firstState[q]));
+        }
+        t.append("\n");
+        t.append(String.format(Locale.US, "Class 0 : a0 = <C0|T> = % .6f   P0 = |a0|^2 = %.8f\n",
+                ev.firstA0, ev.firstA0 * ev.firstA0));
+        t.append(String.format(Locale.US, "Class 1 : a0 = <C1|T> = % .6f   P1 = |a0|^2 = %.8f\n",
+                ev.firstA1, ev.firstA1 * ev.firstA1));
+        t.append("Actual class = ").append(ev.actual[0]).append("   Predicted class = ")
+         .append(ev.predicted[0]).append("\n");
+
+        sb.append("<h4>First test sample &ndash; UU&dagger; calculation</h4>");
+        sb.append("<pre>").append(h(t.toString())).append("</pre>");
+        appendFirstPredictions(sb, ev);
+    }
+    private static void appendQfdnnEvaluation(StringBuilder sb, Evaluation ev) {
+        sb.append("<p class='method'>").append(h(ev.method)).append("</p>");
+        sb.append("<div class='grid'>");
+        metric(sb, "Accuracy", f(ev.accuracy * 100.0, 2) + "%");
+        metric(sb, "Precision", f(ev.precision, 4));
+        metric(sb, "Recall", f(ev.recall, 4));
+        metric(sb, "F1 score", f(ev.f1, 4));
+        sb.append("</div>");
+        sb.append("<h4>Confusion matrix (test set, ").append(ev.testCount).append(" samples)</h4>");
+        sb.append("<table class='cm'><tr><th></th><th>Predicted 0</th><th>Predicted 1</th></tr>");
+        sb.append("<tr><th>Actual 0</th><td>").append(ev.confusion[0][0]).append("</td><td>")
+          .append(ev.confusion[0][1]).append("</td></tr>");
+        sb.append("<tr><th>Actual 1</th><td>").append(ev.confusion[1][0]).append("</td><td>")
+          .append(ev.confusion[1][1]).append("</td></tr></table>");
+        sb.append("<p class='note'>Decision rule: predict class 1 when P1 &minus; P0 &gt; ")
+          .append(f(ev.threshold, 6)).append(" (threshold tuned on the training set).</p>");
+        appendFirstPredictions(sb, ev);
+    }
+
+    private static void appendFirstPredictions(StringBuilder sb, Evaluation ev) {
+        sb.append("<h4>First 5 test predictions</h4>");
+        sb.append("<table><tr><th>#</th><th>Actual</th><th>Predicted</th><th>P0</th><th>P1</th><th>Result</th></tr>");
+
+        int show = Math.min(5, ev.testCount);
+        for (int i = 0; i < show; i++) {
+            boolean ok = (ev.predicted[i] == ev.actual[i]);
+            sb.append("<tr><td>").append(i + 1).append("</td><td>").append(ev.actual[i])
+              .append("</td><td>").append(ev.predicted[i]).append("</td><td>")
+              .append(f(ev.probs[i][0], 8)).append("</td><td>").append(f(ev.probs[i][1], 8))
+              .append("</td><td class='").append(ok ? "ok" : "bad").append("'>")
+              .append(ok ? "OK" : "WRONG").append("</td></tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private static void metric(StringBuilder sb, String label, String value) {
+        sb.append("<div class='metric'><span>").append(label).append("</span><b>")
+          .append(value).append("</b></div>");
+    }
+
+    private static void appendAlg2(StringBuilder sb, Alg2Report r, Prepared p) {
+        int features = (1 << r.qubits) - 1;
+
+        sb.append("<h3>Encoding resources</h3>");
+        sb.append("<table class='kv'>");
+        kv(sb, "Qubits used", String.valueOf(r.qubits));
+        kv(sb, "Amplitudes", String.valueOf(1 << r.qubits));
+        kv(sb, "Features encoded", features + " (2<sup>N</sup> &minus; 1) + 1 zero pad");
+        kv(sb, "U gates per qubit", "q1 : " + r.firstCircuit.gatesOnQubit(0)
+                + " , q2 : " + r.firstCircuit.gatesOnQubit(1)
+                + " , q3 : " + r.firstCircuit.gatesOnQubit(2));
+        kv(sb, "Total U gates", String.valueOf(r.firstCircuit.gateCount()));
+        kv(sb, "Qubits needed by angle encoding", String.valueOf(features) + " (one qubit per feature)");
+        sb.append("</table>");
+
+        sb.append("<h3>Gate counts </h3>");
+        sb.append("<p class='note'>The circuit diagrams are removed from this page. The computed gate counts and encoding checks remain available below.</p>");
+        appendGateTable(sb, r.firstCircuit, false);
+        appendGateTable(sb, r.centroidCircuit0, true);
+        appendGateTable(sb, r.centroidCircuit1, true);
+
+        sb.append("<h3>Encoding quality</h3>");
+        sb.append("<table class='kv'>");
+        kv(sb, "States encoded and checked", r.checked + " (all test samples + 2 centroids)");
+        kv(sb, "Minimum fidelity |&lang;target|encoded&rang;|&sup2;", f(r.minFidelity, 12));
+        kv(sb, "Mean fidelity", f(r.meanFidelity, 12));
+        kv(sb, "Maximum amplitude error", String.format(Locale.US, "%.2e", r.maxError));
+        sb.append("</table>");
+
+        sb.append("<h3>First test sample &ndash; wanted state and circuit output</h3>");
+        sb.append("<table><tr><th>Basis state</th><th>Wanted amplitude</th><th>Circuit output</th></tr>");
+        for (int q = 0; q < STATE_SIZE; q++) {
+            sb.append("<tr><td>|").append(bits(q)).append("&rang;</td><td>")
+              .append(f(r.firstTarget[q], 8)).append("</td><td>")
+              .append(f(r.firstEncoded[q], 8)).append("</td></tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private static void appendDiagram(StringBuilder sb, MultiQubitEnc.Circuit circuit, boolean inverse) {
+        List<String> lines = MultiQubitEnc.diagram(circuit, inverse);
+        StringBuilder text = new StringBuilder();
+        for (String line : lines) {
+            text.append(line).append("\n");
+        }
+        text.append("\n[Uk] = U gate k,  filled circle = controller (|1>),  empty circle = anti-controller (|0>)\n");
+        sb.append("<pre class='circuit'>").append(h(text.toString())).append("</pre>");
+    }
+
+    private static void appendGateTable(StringBuilder sb, MultiQubitEnc.Circuit circuit, boolean inverse) {
+
+        List<MultiQubitEnc.Gate> gates = MultiQubitEnc.orderedGates(circuit, inverse);
+        sb.append("<table><tr><th>Step</th><th>Gate</th><th>Target</th><th>Controls</th><th>Angle</th></tr>");
+
+        int step = 1;
+        for (MultiQubitEnc.Gate gate : gates) {
+            double angle = gate.angle;
+            String name = "U(&theta;" + gate.number + ")";
+            if (inverse) {
+                angle = -gate.angle;
+                name = "U&dagger;(&theta;" + gate.number + ")";
+            }
+            sb.append("<tr><td>").append(step).append("</td><td>").append(name)
+              .append("</td><td>q").append(gate.target + 1).append("</td><td>")
+              .append(h(gate.controlsText())).append("</td><td>").append(f(angle, 4)).append("</td></tr>");
+            step++;
+        }
+        sb.append("</table>");
+    }
+
+    private static void compareRow(StringBuilder sb, String name, Evaluation ev) {
+        sb.append("<tr><td>").append(name).append("</td><td>").append(f(ev.accuracy * 100.0, 2))
+          .append("%</td><td>").append(f(ev.precision, 4)).append("</td><td>")
+          .append(f(ev.recall, 4)).append("</td><td>").append(f(ev.f1, 4)).append("</td></tr>");
+    }
+    private static void startServer(Map<String, String> pages) {
+
+        HttpServer server = null;
+        int port = START_PORT;
+
+        while (server == null && port <= START_PORT + 10) {
+            try {
+                server = HttpServer.create(new InetSocketAddress(port), 0);
+            } catch (IOException e) {
+                port++;
+            }
+        }
+
+        if (server == null) {
+            System.err.println("Could not start the web server (ports " + START_PORT + "-"
+                    + (START_PORT + 10) + " are busy).");
+            return;
+        }
+
+        final String page = buildPage();
+        server.createContext("/", exchange -> sendText(exchange, page));
+        for (final Map.Entry<String, String> entry : pages.entrySet()) {
+            server.createContext("/result/" + entry.getKey(), exchange -> sendText(exchange, entry.getValue()));
+        }
+
+        server.setExecutor(null);
+        server.start();
+
+        String url = "http://localhost:" + port;
+
+        System.out.println();
+        System.out.println("Web page is ready  ->  " + url);
+        System.out.println("Open it in your browser and use the buttons.");
+        System.out.println("(Press Ctrl+C to quit.)");
+
+        try {
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().browse(new URI(url));
+            }
+        } catch (Exception e) {
+        } catch (java.awt.AWTError e) {
+
+        }
+    }
+
+    private static void sendText(com.sun.net.httpserver.HttpExchange exchange, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    private static String buildPage() {
+
+        StringBuilder sb = new StringBuilder();
+
+        sb.append("<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='utf-8'>\n");
+        sb.append("<meta name='viewport' content='width=device-width, initial-scale=1'>\n");
+        sb.append("<title>QFDNN Results</title>\n<style>\n");
+        sb.append("body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#f2f4f9;color:#1c2333;}\n");
+        sb.append("header{background:#1f2a52;color:#fff;padding:22px 32px;}\n");
+        sb.append("header h1{margin:0;font-size:24px;}\n");
+        sb.append("header p{margin:6px 0 0;color:#c9d2f0;font-size:14px;}\n");
+        sb.append(".buttons{display:flex;gap:10px;flex-wrap:wrap;padding:16px 32px;background:#fff;");
+        sb.append("border-bottom:1px solid #d9deea;position:sticky;top:0;z-index:5;}\n");
+        sb.append("button{font-size:14px;padding:10px 16px;border:2px solid #3b53b4;background:#fff;color:#3b53b4;");
+        sb.append("border-radius:8px;cursor:pointer;font-weight:600;}\n");
+        sb.append("button:hover{background:#e8ecfb;}\n");
+        sb.append("button.active{background:#3b53b4;color:#fff;}\n");
+        sb.append("#out{max-width:1100px;margin:0 auto;padding:24px 32px 60px;}\n");
+        sb.append("#out h1{font-size:22px;margin-top:0;}\n");
+        sb.append("section.dataset{background:#fff;border:1px solid #d9deea;border-radius:12px;");
+        sb.append("padding:8px 26px 22px;margin:20px 0;}\n");
+        sb.append("section.dataset h2{color:#1f2a52;border-bottom:2px solid #e3e7f3;padding-bottom:8px;}\n");
+        sb.append("h3{margin:26px 0 8px;color:#2c3c7a;}\n");
+        sb.append("h4{margin:16px 0 6px;color:#44507a;}\n");
+        sb.append("table{border-collapse:collapse;margin:6px 0 10px;font-size:14px;}\n");
+        sb.append("th,td{border:1px solid #d4d9e8;padding:6px 12px;text-align:left;}\n");
+        sb.append("th{background:#eef1fa;}\n");
+        sb.append("table.kv th{width:340px;}\n");
+        sb.append("table.cm td,table.cm th{text-align:center;min-width:90px;}\n");
+        sb.append(".grid{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0;}\n");
+        sb.append(".metric{background:#eef1fa;border-radius:10px;padding:12px 22px;min-width:130px;}\n");
+        sb.append(".metric span{display:block;font-size:13px;color:#56608a;}\n");
+        sb.append(".metric b{font-size:24px;color:#1f2a52;}\n");
+        sb.append(".two{display:flex;gap:30px;flex-wrap:wrap;}\n");
+        sb.append("pre{background:#10162b;color:#d6def7;padding:14px 16px;border-radius:8px;overflow-x:auto;");
+        sb.append("font-size:13px;line-height:1.5;}\n");
+        sb.append(".note{color:#4b5575;font-size:14px;}\n");
+        sb.append(".method{font-weight:600;color:#3b53b4;}\n");
+        sb.append(".ok{color:#18803a;font-weight:600;}\n");
+        sb.append(".bad{color:#c0262d;font-weight:600;}\n");
+        sb.append(".error{background:#fde8e8;color:#8c1d1d;padding:12px 16px;border-radius:8px;}\n");
+        sb.append(".flow li{margin:4px 0;}\n");
+        sb.append("</style>\n</head>\n<body>\n");
+
+        sb.append("<header><h1>QFDNN &ndash; Quantum Feature Deep Neural Network</h1>");
+        sb.append("<p>Credit card fraud detection and loan eligibility prediction &middot; ");
+        sb.append("UU&dagger; method, multiple qubit amplitude encoding, variational circuit and COBYLA training</p></header>\n");
+
+        sb.append("<div class='buttons'>");
+        sb.append("<button id='b1' onclick=\"show('alg1','b1')\">Algorithm 1</button>");
+        sb.append("<button id='b2' onclick=\"show('alg2','b2')\">Algorithm 2</button>");
+        sb.append("<button id='b3' onclick=\"show('alg3','b3')\">Algorithm 3</button>");
+        sb.append("<button id='b4' onclick=\"show('combined','b4')\">Combined (Alg 1 + 2 + 3)</button>");
+        sb.append("<button id='b5' onclick=\"show('alg4','b5')\">Algorithm 4 (QFDNN)</button>");
+        sb.append("<button id='b6' onclick=\"show('viz','b6')\">Visualization &amp; Tables</button>");
+        sb.append("<button id='b7' onclick=\"show('novelty','b7')\">Novelty (ZGATRO)</button>");
+        sb.append("</div>\n");
+
+        sb.append("<div id='out'><p class='note'>Click one of the buttons above to see a result.</p></div>\n");
+
+        sb.append("<script>\n");
+        sb.append("function show(which, buttonId) {\n");
+        sb.append("  var buttons = document.querySelectorAll('.buttons button');\n");
+        sb.append("  for (var i = 0; i < buttons.length; i++) { buttons[i].classList.remove('active'); }\n");
+        sb.append("  document.getElementById(buttonId).classList.add('active');\n");
+        sb.append("  var out = document.getElementById('out');\n");
+        sb.append("  out.innerHTML = '<p class=\"note\">Loading ...</p>';\n");
+        sb.append("  fetch('/result/' + which)\n");
+        sb.append("    .then(function (r) { return r.text(); })\n");
+        sb.append("    .then(function (html) { out.innerHTML = html; window.scrollTo(0, 0); });\n");
+        sb.append("}\n");
+        sb.append("</script>\n</body>\n</html>\n");
+
+        return sb.toString();
+    }
+
+    private static void writeSummaryFile(List<DatasetResult> results) {
+
+        try (PrintWriter w = new PrintWriter(new FileWriter(SUMMARY_FILE))) {
+
+            w.println("QFDNN - summary of results");
+            w.println("==========================");
+
+            for (DatasetResult dr : results) {
+
+                w.println();
+                w.println("DATASET: " + dr.name);
+
+                if (dr.error != null) {
+                    w.println("  ERROR: " + dr.error);
+                    continue;
+                }
+
+                w.println("  Algorithm 1        : " + summaryLine(dr.eval1));
+                w.println("  Algorithm 2        : " + dr.report2.checked + " states encoded, min fidelity "
+                        + f(dr.report2.minFidelity, 12) + ", gates " + dr.report2.firstCircuit.gateCount()
+                        + ", qubits " + dr.report2.qubits);
+                w.println("  Alg 1 + 2          : " + summaryLine(dr.evalCombined));
+                w.println("  Alg 1 + 2 + 3      : " + summaryLine(dr.evalCombined3) + "   (random angles)");
+                w.println("  Algorithm 4 QFDNN  : " + summaryLine(dr.eval4) + "   (" + dr.training4.evaluations
+                        + " COBYLA evaluations)");
+                w.println("  Variational only   : " + summaryLine(dr.evalVar));
+                for (Evaluation ev : dr.classical) {
+                    w.println("  " + ev.method + " : " + summaryLine(ev));
+                }
+            }
+
+        } catch (IOException e) {
+            System.out.println("Could not write " + SUMMARY_FILE + " : " + e.getMessage());
+        }
+    }
+
+    private static String summaryLine(Evaluation ev) {
+        return "accuracy " + f(ev.accuracy * 100.0, 2) + "%, precision " + f(ev.precision, 4)
+                + ", recall " + f(ev.recall, 4) + ", F1 " + f(ev.f1, 4);
+    }
+    private static double bestThreshold(double[] score, int[] labels) {
+
+        int n = score.length;
+        final double[] s = score;
+
+        Integer[] order = new Integer[n];
+        for (int i = 0; i < n; i++) {
+            order[i] = i;
+        }
+
+        Arrays.sort(order, (a, b) -> Double.compare(s[a], s[b]));
+
+        int correct = count(labels, 1);
+        int bestCorrect = correct;
+        double bestThreshold = score[order[0]] - 1.0e-9;
+
+        for (int k = 0; k < n; k++) {
+            if (labels[order[k]] == 0) {
+                correct++;
+            } else {
+                correct--;
+            }
+
+            boolean lastOne = (k == n - 1);
+            boolean valueChanges = false;
+            if (!lastOne) {
+                valueChanges = score[order[k]] < score[order[k + 1]];
+            }
+
+            if (lastOne || valueChanges) {
+                if (correct > bestCorrect) {
+                    bestCorrect = correct;
+                    if (lastOne) {
+                        bestThreshold = score[order[k]] + 1.0e-9;
+                    } else {
+                        bestThreshold = 0.5 * (score[order[k]] + score[order[k + 1]]);
+                    }
+                }
+            }
+        }
+
+        return bestThreshold;
+    }
+
+    private static double[][] kmeansCentroids(double[][] X, int[] labels) {
+
+        int n = X.length;
+        int d = X[0].length;
+        double[][] centers = new double[2][d];
+        int[] classCount = new int[2];
+
+        for (int i = 0; i < n; i++) {
+            int c = labels[i];
+            classCount[c]++;
+            for (int j = 0; j < d; j++) {
+                centers[c][j] += X[i][j];
+            }
+        }
+
+        for (int k = 0; k < 2; k++) {
+            for (int j = 0; j < d; j++) {
+                centers[k][j] = centers[k][j] / Math.max(1, classCount[k]);
+            }
+        }
+
+        for (int iteration = 0; iteration < KMEANS_MAX_ITER; iteration++) {
+
+            double[][] newCenters = new double[2][d];
+            int[] members = new int[2];
+
+            for (int i = 0; i < n; i++) {
+                int cluster = 1;
+                if (dist(X[i], centers[0]) <= dist(X[i], centers[1])) {
+                    cluster = 0;
+                }
+                members[cluster]++;
+                for (int j = 0; j < d; j++) {
+                    newCenters[cluster][j] += X[i][j];
+                }
+            }
+
+            double movement = 0.0;
+
+            for (int k = 0; k < 2; k++) {
+                if (members[k] == 0) {
+                    newCenters[k] = centers[k].clone();
+                } else {
+                    for (int j = 0; j < d; j++) {
+                        newCenters[k][j] = newCenters[k][j] / members[k];
+                    }
+                }
+                movement += dist(centers[k], newCenters[k]);
+            }
+
+            centers = newCenters;
+
+            if (movement < 1.0e-10) {
+                break;
+            }
+        }
+
+        return centers;
+    }
+
+    private static double[] amplitudeEncode(double[] features) {
+
+        double[] state = new double[STATE_SIZE];
+
+        for (int i = 0; i < PCA_COMPONENTS; i++) {
+            state[i] = features[i];
+        }
+        double length = norm(state);
+
+        if (length < EPS) {
+            state[0] = 1.0;
+            return state;
+        }
+
+        for (int i = 0; i < STATE_SIZE; i++) {
+            state[i] = state[i] / length;
+        }
+
+        return state;
+    }
+    private static DataSet loadCSV(String path, Set<String> dropCols) throws IOException {
+
+        File file = new File(path);
+        if (!file.exists()) {
+            throw new IOException("CSV file not found: " + file.getAbsolutePath());
+        }
+
+        List<String[]> rows = new ArrayList<String[]>();
+        String[] header;
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+
+            String headerLine = reader.readLine();
+            if (headerLine == null) {
+                throw new IOException("CSV is empty");
+            }
+
+            header = parseCSV(headerLine);
+            for (int i = 0; i < header.length; i++) {
+                header[i] = clean(header[i]);
+            }
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                String[] fields = parseCSV(line);
+                if (fields.length == header.length) {
+                    rows.add(fields);
+                }
+            }
+        }
+
+        if (rows.isEmpty()) {
+            throw new IOException("No data rows");
+        }
+
+        int targetCol = header.length - 1;
+        String[] preferred = {"Class", "Loan_Status", "Target", "Label"};
+        boolean found = false;
+
+        for (int p = 0; p < preferred.length && !found; p++) {
+            for (int i = 0; i < header.length; i++) {
+                if (header[i].equalsIgnoreCase(preferred[p])) {
+                    targetCol = i;
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        List<Integer> featureCols = new ArrayList<Integer>();
+
+        for (int c = 0; c < header.length; c++) {
+            String lower = header[c].toLowerCase(Locale.ROOT);
+            if (c == targetCol) {
+                continue;
+            }
+            if (isId(lower)) {
+                continue;
+            }
+            if (dropCols.contains(lower)) {
+                continue;
+            }
+            featureCols.add(c);
+        }
+
+        List<String> targetValues = new ArrayList<String>();
+
+        for (String[] row : rows) {
+            String value = clean(row[targetCol]);
+            if (!missing(value) && !containsIgnoreCase(targetValues, value)) {
+                targetValues.add(value);
+            }
+        }
+
+        if (targetValues.size() != 2) {
+            throw new IOException("Target must have 2 classes, found "
+                    + targetValues.size() + " " + targetValues);
+        }
+
+        String class0;
+        String class1;
+
+        if (containsIgnoreCase(targetValues, "N") && containsIgnoreCase(targetValues, "Y")) {
+            class0 = findIgnoreCase(targetValues, "N");
+            class1 = findIgnoreCase(targetValues, "Y");
+        } else if (containsIgnoreCase(targetValues, "0") && containsIgnoreCase(targetValues, "1")) {
+            class0 = findIgnoreCase(targetValues, "0");
+            class1 = findIgnoreCase(targetValues, "1");
+        } else {
+            Collections.sort(targetValues);
+            class0 = targetValues.get(0);
+            class1 = targetValues.get(1);
+        }
+
+        int featureCount = featureCols.size();
+        boolean[] isNumeric = new boolean[featureCount];
+        double[] fillValue = new double[featureCount];
+
+        @SuppressWarnings("unchecked")
+        Map<String, Integer>[] categoryCodes = new Map[featureCount];
+
+        for (int j = 0; j < featureCount; j++) {
+
+            int col = featureCols.get(j);
+            int checked = 0;
+            int numeric = 0;
+            List<Double> numbers = new ArrayList<Double>();
+
+            for (String[] row : rows) {
+                String value = clean(row[col]);
+                if (missing(value)) {
+                    continue;
+                }
+                checked++;
+                Double number = parseNumber(value);
+                if (number != null) {
+                    numeric++;
+                    numbers.add(number);
+                }
+            }
+
+            isNumeric[j] = (checked > 0) && (numeric / (double) checked >= 0.80);
+
+            if (isNumeric[j]) {
+                fillValue[j] = median(numbers);
+            } else {
+                categoryCodes[j] = new LinkedHashMap<String, Integer>();
+                Map<Integer, Integer> frequency = new HashMap<Integer, Integer>();
+
+                for (String[] row : rows) {
+                    String value = clean(row[col]);
+                    if (missing(value)) {
+                        continue;
+                    }
+                    String key = value.toLowerCase(Locale.ROOT);
+                    if (!categoryCodes[j].containsKey(key)) {
+                        categoryCodes[j].put(key, categoryCodes[j].size());
+                    }
+                    int code = categoryCodes[j].get(key);
+                    Integer old = frequency.get(code);
+                    if (old == null) {
+                        frequency.put(code, 1);
+                    } else {
+                        frequency.put(code, old + 1);
+                    }
+                }
+
+                int modeCode = 0;
+                int modeCount = -1;
+                for (Map.Entry<Integer, Integer> entry : frequency.entrySet()) {
+                    if (entry.getValue() > modeCount) {
+                        modeCount = entry.getValue();
+                        modeCode = entry.getKey();
+                    }
+                }
+                fillValue[j] = modeCode;
+            }
+        }
+
+        List<double[]> xList = new ArrayList<double[]>();
+        List<Integer> yList = new ArrayList<Integer>();
+
+        for (String[] row : rows) {
+
+            String target = clean(row[targetCol]);
+            int label;
+
+            if (target.equalsIgnoreCase(class0)) {
+                label = 0;
+            } else if (target.equalsIgnoreCase(class1)) {
+                label = 1;
+            } else {
+                continue;
+            }
+
+            double[] vector = new double[featureCount];
+
+            for (int j = 0; j < featureCount; j++) {
+
+                String text = clean(row[featureCols.get(j)]);
+
+                if (missing(text)) {
+                    vector[j] = fillValue[j];
+                } else if (isNumeric[j]) {
+                    Double number = parseNumber(text);
+                    if (number == null) {
+                        vector[j] = fillValue[j];
+                    } else {
+                        vector[j] = number;
+                    }
+                } else {
+                    Integer code = categoryCodes[j].get(text.toLowerCase(Locale.ROOT));
+                    if (code == null) {
+                        vector[j] = fillValue[j];
+                    } else {
+                        vector[j] = code;
+                    }
+                }
+            }
+
+            xList.add(vector);
+            yList.add(label);
+        }
+
+        double[][] X = xList.toArray(new double[0][]);
+        int[] Y = new int[yList.size()];
+        for (int i = 0; i < Y.length; i++) {
+            Y[i] = yList.get(i);
+        }
+
+        X = removeConstantColumns(X);
+
+        if (X[0].length < PCA_COMPONENTS) {
+            throw new IOException("Only " + X[0].length + " usable features, need " + PCA_COMPONENTS);
+        }
+
+        return new DataSet(X, Y, header[targetCol], class0, class1);
+    }
+
+    private static DataSet samplePaperStyle(DataSet data, boolean balanced,
+                                            int maxSamples, long seed) {
+
+        if (maxSamples <= 0) {
+            return data;
+        }
+
+        List<Integer> class0 = new ArrayList<Integer>();
+        List<Integer> class1 = new ArrayList<Integer>();
+
+        for (int i = 0; i < data.y.length; i++) {
+            if (data.y[i] == 0) {
+                class0.add(i);
+            } else {
+                class1.add(i);
+            }
+        }
+
+        Random random = new Random(seed + 7);
+        Collections.shuffle(class0, random);
+        Collections.shuffle(class1, random);
+
+        int take0;
+        int take1;
+
+        if (balanced) {
+            int each = Math.min(maxSamples / 2, Math.min(class0.size(), class1.size()));
+            take0 = each;
+            take1 = each;
+        } else {
+            if (data.y.length <= maxSamples) {
+                return data;
+            }
+            take0 = (int) Math.round(maxSamples * class0.size() / (double) data.y.length);
+            take1 = maxSamples - take0;
+        }
+
+        List<Integer> chosen = new ArrayList<Integer>();
+        chosen.addAll(class0.subList(0, Math.min(take0, class0.size())));
+        chosen.addAll(class1.subList(0, Math.min(take1, class1.size())));
+
+        double[][] X = new double[chosen.size()][];
+        int[] Y = new int[chosen.size()];
+
+        for (int i = 0; i < chosen.size(); i++) {
+            X[i] = data.x[chosen.get(i)];
+            Y[i] = data.y[chosen.get(i)];
+        }
+
+        return new DataSet(X, Y, data.targetName, data.c0, data.c1);
+    }
+
+    private static Split stratifiedSplit(double[][] X, int[] y, double testFraction, long seed) {
+
+        List<Integer> class0 = new ArrayList<Integer>();
+        List<Integer> class1 = new ArrayList<Integer>();
+
+        for (int i = 0; i < y.length; i++) {
+            if (y[i] == 0) {
+                class0.add(i);
+            } else {
+                class1.add(i);
+            }
+        }
+
+        Random random = new Random(seed);
+        Collections.shuffle(class0, random);
+        Collections.shuffle(class1, random);
+
+        List<Integer> trainIdx = new ArrayList<Integer>();
+        List<Integer> testIdx = new ArrayList<Integer>();
+
+        splitOneClass(class0, testFraction, trainIdx, testIdx);
+        splitOneClass(class1, testFraction, trainIdx, testIdx);
+
+        Collections.shuffle(trainIdx, random);
+        Collections.shuffle(testIdx, random);
+
+        double[][] trX = new double[trainIdx.size()][];
+        int[] trY = new int[trainIdx.size()];
+        double[][] teX = new double[testIdx.size()][];
+        int[] teY = new int[testIdx.size()];
+
+        for (int i = 0; i < trainIdx.size(); i++) {
+            trX[i] = X[trainIdx.get(i)].clone();
+            trY[i] = y[trainIdx.get(i)];
+        }
+        for (int i = 0; i < testIdx.size(); i++) {
+            teX[i] = X[testIdx.get(i)].clone();
+            teY[i] = y[testIdx.get(i)];
+        }
+
+        return new Split(trX, trY, teX, teY);
+    }
+
+    private static void splitOneClass(List<Integer> indices, double testFraction,
+                                      List<Integer> train, List<Integer> test) {
+
+        int testCount = (int) Math.round(indices.size() * testFraction);
+
+        if (indices.size() > 1) {
+            testCount = Math.max(1, Math.min(indices.size() - 1, testCount));
+        } else {
+            testCount = 0;
+        }
+
+        for (int i = 0; i < indices.size(); i++) {
+            if (i < testCount) {
+                test.add(indices.get(i));
+            } else {
+                train.add(indices.get(i));
+            }
+        }
+    }
+
+    private static class Standardizer {
+
+        final double[] mean;
+        final double[] std;
+
+        Standardizer(double[] mean, double[] std) {
+            this.mean = mean;
+            this.std = std;
+        }
+
+        static Standardizer fit(double[][] X) {
+
+            int n = X.length;
+            int d = X[0].length;
+            double[] mean = new double[d];
+            double[] std = new double[d];
+
+            for (double[] row : X) {
+                for (int j = 0; j < d; j++) {
+                    mean[j] += row[j];
+                }
+            }
+            for (int j = 0; j < d; j++) {
+                mean[j] = mean[j] / n;
+            }
+            for (double[] row : X) {
+                for (int j = 0; j < d; j++) {
+                    std[j] += sq(row[j] - mean[j]);
+                }
+            }
+            for (int j = 0; j < d; j++) {
+                std[j] = Math.sqrt(std[j] / n);
+                if (std[j] < EPS) {
+                    std[j] = 1.0;
+                }
+            }
+            return new Standardizer(mean, std);
+        }
+
+        void transform(double[][] X) {
+            for (double[] row : X) {
+                for (int j = 0; j < row.length; j++) {
+                    row[j] = (row[j] - mean[j]) / std[j];
+                }
+            }
+        }
+    }
+
+    private static Split smote(Split sp, int k, long seed) {
+
+        List<double[]> class0 = new ArrayList<double[]>();
+        List<double[]> class1 = new ArrayList<double[]>();
+
+        for (int i = 0; i < sp.trX.length; i++) {
+            if (sp.trY[i] == 0) {
+                class0.add(sp.trX[i]);
+            } else {
+                class1.add(sp.trX[i]);
+            }
+        }
+
+        if (class0.isEmpty() || class1.isEmpty() || class0.size() == class1.size()) {
+            return sp;
+        }
+
+        List<double[]> minority;
+        int minorityLabel;
+
+        if (class0.size() < class1.size()) {
+            minority = class0;
+            minorityLabel = 0;
+        } else {
+            minority = class1;
+            minorityLabel = 1;
+        }
+
+        int needed = Math.abs(class0.size() - class1.size());
+
+        if (minority.size() < 2) {
+            return sp;
+        }
+
+        int neighbours = Math.min(k, minority.size() - 1);
+        int[][] nearest = new int[minority.size()][];
+        for (int i = 0; i < minority.size(); i++) {
+            nearest[i] = nearestNeighbours(minority, i, neighbours);
+        }
+
+        Random random = new Random(seed + 100);
+
+        int oldSize = sp.trX.length;
+        double[][] newX = Arrays.copyOf(sp.trX, oldSize + needed);
+        int[] newY = Arrays.copyOf(sp.trY, oldSize + needed);
+
+        for (int s = 0; s < needed; s++) {
+
+            int baseIndex = random.nextInt(minority.size());
+            double[] base = minority.get(baseIndex);
+
+            int neighbourIndex = nearest[baseIndex][random.nextInt(neighbours)];
+            double[] neighbour = minority.get(neighbourIndex);
+
+            double lambda = random.nextDouble();
+
+            double[] sample = new double[base.length];
+            for (int j = 0; j < sample.length; j++) {
+                sample[j] = base[j] + lambda * (neighbour[j] - base[j]);
+            }
+
+            newX[oldSize + s] = sample;
+            newY[oldSize + s] = minorityLabel;
+        }
+
+        return new Split(newX, newY, sp.teX, sp.teY);
+    }
+
+    private static int[] nearestNeighbours(List<double[]> points, int index, int k) {
+
+        int n = points.size();
+        final double[] distance = new double[n];
+        Integer[] order = new Integer[n];
+
+        for (int i = 0; i < n; i++) {
+            if (i == index) {
+                distance[i] = Double.POSITIVE_INFINITY;
+            } else {
+                distance[i] = dist(points.get(index), points.get(i));
+            }
+            order[i] = i;
+        }
+
+        Arrays.sort(order, (a, b) -> Double.compare(distance[a], distance[b]));
+
+        int[] result = new int[k];
+        for (int i = 0; i < k; i++) {
+            result[i] = order[i];
+        }
+        return result;
+    }
+
+    private static class PCA {
+
+        final double[] mean;
+        final double[][] components;
+        final int count;
+
+        PCA(double[] mean, double[][] components, int count) {
+            this.mean = mean;
+            this.components = components;
+            this.count = count;
+        }
+
+        static PCA fit(double[][] X, int requested) {
+
+            int n = X.length;
+            int d = X[0].length;
+            double[] mean = new double[d];
+            for (double[] row : X) {
+                for (int j = 0; j < d; j++) {
+                    mean[j] += row[j];
+                }
+            }
+            for (int j = 0; j < d; j++) {
+                mean[j] = mean[j] / n;
+            }
+
+            double[][] cov = new double[d][d];
+            for (double[] row : X) {
+                for (int i = 0; i < d; i++) {
+                    double di = row[i] - mean[i];
+                    for (int j = i; j < d; j++) {
+                        cov[i][j] += di * (row[j] - mean[j]);
+                    }
+                }
+            }
+            for (int i = 0; i < d; i++) {
+                for (int j = i; j < d; j++) {
+                    cov[i][j] = cov[i][j] / Math.max(1, n - 1);
+                    cov[j][i] = cov[i][j];
+                }
+            }
+
+            double[][] vectors = new double[d][d];
+            final double[] values = jacobi(cov, vectors);
+
+            Integer[] order = new Integer[d];
+            for (int i = 0; i < d; i++) {
+                order[i] = i;
+            }
+            Arrays.sort(order, (a, b) -> Double.compare(values[b], values[a]));
+
+            int keep = Math.min(requested, d);
+            double[][] comp = new double[keep][d];
+            for (int c = 0; c < keep; c++) {
+                for (int j = 0; j < d; j++) {
+                    comp[c][j] = vectors[j][order[c]];
+                }
+            }
+            return new PCA(mean, comp, keep);
+        }
+
+        double[][] transform(double[][] X) {
+            double[][] result = new double[X.length][count];
+            for (int i = 0; i < X.length; i++) {
+                for (int c = 0; c < count; c++) {
+                    double sum = 0.0;
+                    for (int j = 0; j < mean.length; j++) {
+                        sum += (X[i][j] - mean[j]) * components[c][j];
+                    }
+                    result[i][c] = sum;
+                }
+            }
+            return result;
+        }
+    }
+
+    private static double[] jacobi(double[][] input, double[][] V) {
+
+        int n = input.length;
+        double[][] A = new double[n][n];
+
+        for (int i = 0; i < n; i++) {
+            A[i] = input[i].clone();
+            Arrays.fill(V[i], 0.0);
+            V[i][i] = 1.0;
+        }
+
+        int maxIterations = 100 * n * n;
+
+        for (int iteration = 0; iteration < maxIterations; iteration++) {
+            int p = 0;
+            int q = 1;
+            double max = Math.abs(A[0][1]);
+
+            for (int i = 0; i < n; i++) {
+                for (int j = i + 1; j < n; j++) {
+                    if (Math.abs(A[i][j]) > max) {
+                        max = Math.abs(A[i][j]);
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+
+            if (max < 1.0e-12) {
+                break;
+            }
+
+            double theta = 0.5 * Math.atan2(2.0 * A[p][q], A[q][q] - A[p][p]);
+            double c = Math.cos(theta);
+            double s = Math.sin(theta);
+
+            double app = A[p][p];
+            double aqq = A[q][q];
+            double apq = A[p][q];
+
+            A[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+            A[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+            A[p][q] = 0.0;
+            A[q][p] = 0.0;
+
+            for (int r = 0; r < n; r++) {
+                if (r == p || r == q) {
+                    continue;
+                }
+                double arp = A[r][p];
+                double arq = A[r][q];
+
+                A[r][p] = c * arp - s * arq;
+                A[p][r] = A[r][p];
+
+                A[r][q] = s * arp + c * arq;
+                A[q][r] = A[r][q];
+            }
+
+            for (int r = 0; r < n; r++) {
+                double vp = V[r][p];
+                double vq = V[r][q];
+                V[r][p] = c * vp - s * vq;
+                V[r][q] = s * vp + c * vq;
+            }
+        }
+
+        double[] values = new double[n];
+        for (int i = 0; i < n; i++) {
+            values[i] = A[i][i];
+        }
+        return values;
+    }
+
+    private static double[] columnStd(double[][] X) {
+
+        int n = X.length;
+        int d = X[0].length;
+        double[] mean = new double[d];
+        double[] std = new double[d];
+
+        for (double[] row : X) {
+            for (int j = 0; j < d; j++) {
+                mean[j] += row[j];
+            }
+        }
+        for (int j = 0; j < d; j++) {
+            mean[j] = mean[j] / n;
+        }
+        for (double[] row : X) {
+            for (int j = 0; j < d; j++) {
+                std[j] += sq(row[j] - mean[j]);
+            }
+        }
+        for (int j = 0; j < d; j++) {
+            std[j] = Math.sqrt(std[j] / n);
+            if (std[j] < EPS) {
+                std[j] = 1.0;
+            }
+        }
+        return std;
+    }
+
+    private static void toUnitRange(double[][] X, double[] sigma) {
+        for (double[] row : X) {
+            for (int j = 0; j < row.length; j++) {
+                double z = row[j] / sigma[j];
+                z = Math.max(-PCA_CLIP, Math.min(PCA_CLIP, z));
+                row[j] = (z + PCA_CLIP) / (2.0 * PCA_CLIP);
+            }
+        }
+    }
+    private static double[][] transpose(double[][] m) {
+        int rows = m.length;
+        int cols = m[0].length;
+        double[][] result = new double[cols][rows];
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                result[j][i] = m[i][j];
+            }
+        }
+        return result;
+    }
+
+    private static double[][] multiplyMatrices(double[][] a, double[][] b) {
+        int rowsA = a.length;
+        int colsA = a[0].length;
+        int colsB = b[0].length;
+        double[][] result = new double[rowsA][colsB];
+        for (int i = 0; i < rowsA; i++) {
+            for (int j = 0; j < colsB; j++) {
+                double sum = 0.0;
+                for (int k = 0; k < colsA; k++) {
+                    sum += a[i][k] * b[k][j];
+                }
+                result[i][j] = sum;
+            }
+        }
+        return result;
+    }
+
+    private static double[] multiplyVector(double[][] m, double[] v) {
+        double[] result = new double[m.length];
+        for (int i = 0; i < m.length; i++) {
+            double sum = 0.0;
+            for (int j = 0; j < v.length; j++) {
+                sum += m[i][j] * v[j];
+            }
+            result[i] = sum;
+        }
+        return result;
+    }
+
+    private static double[][] removeConstantColumns(double[][] X) {
+
+        int d = X[0].length;
+        boolean[] keep = new boolean[d];
+        int keepCount = 0;
+
+        for (int j = 0; j < d; j++) {
+            for (int i = 1; i < X.length; i++) {
+                if (Math.abs(X[i][j] - X[0][j]) > EPS) {
+                    keep[j] = true;
+                    keepCount++;
+                    break;
+                }
+            }
+        }
+
+        if (keepCount == d) {
+            return X;
+        }
+
+        double[][] result = new double[X.length][keepCount];
+        for (int i = 0; i < X.length; i++) {
+            int newIndex = 0;
+            for (int j = 0; j < d; j++) {
+                if (keep[j]) {
+                    result[i][newIndex] = X[i][j];
+                    newIndex++;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static String[] parseCSV(String line) {
+
+        List<String> fields = new ArrayList<String>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char ch = line.charAt(i);
+            if (ch == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    current.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (ch == ',' && !inQuotes) {
+                fields.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(ch);
+            }
+        }
+
+        fields.add(current.toString());
+        return fields.toArray(new String[0]);
+    }
+
+    private static String clean(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("\uFEFF", "").replace("'", "").replace("\"", "").trim();
+    }
+
+    private static boolean missing(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return true;
+        }
+        String s = value.trim().toLowerCase(Locale.ROOT);
+        return s.equals("na") || s.equals("n/a") || s.equals("null")
+                || s.equals("nan") || s.equals("?");
+    }
+
+    private static Double parseNumber(String value) {
+        try {
+            String s = value.trim();
+            if (s.endsWith("+")) {
+                s = s.substring(0, s.length() - 1);
+            }
+            double d = Double.parseDouble(s);
+            if (Double.isFinite(d)) {
+                return d;
+            }
+            return null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static boolean isId(String name) {
+        return name.equals("id") || name.equals("index") || name.equals("loan_id")
+                || name.equals("loanid") || name.equals("customer_id");
+    }
+
+    private static double median(List<Double> values) {
+        if (values.isEmpty()) {
+            return 0.0;
+        }
+        Collections.sort(values);
+        int n = values.size();
+        if (n % 2 == 1) {
+            return values.get(n / 2);
+        }
+        return 0.5 * (values.get(n / 2 - 1) + values.get(n / 2));
+    }
+
+    private static boolean containsIgnoreCase(List<String> list, String target) {
+        return findIgnoreCase(list, target) != null;
+    }
+
+    private static String findIgnoreCase(List<String> list, String target) {
+        for (String s : list) {
+            if (s.equalsIgnoreCase(target)) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    private static int count(int[] y, int target) {
+        int c = 0;
+        for (int v : y) {
+            if (v == target) {
+                c++;
+            }
+        }
+        return c;
+    }
+
+    private static double sq(double x) {
+        return x * x;
+    }
+
+    private static double dot(double[] a, double[] b) {
+        double sum = 0.0;
+        for (int i = 0; i < a.length; i++) {
+            sum += a[i] * b[i];
+        }
+        return sum;
+    }
+
+    private static double norm(double[] a) {
+        return Math.sqrt(dot(a, a));
+    }
+
+    private static double dist(double[] a, double[] b) {
+        double sum = 0.0;
+        for (int i = 0; i < a.length; i++) {
+            sum += sq(a[i] - b[i]);
+        }
+        return Math.sqrt(sum);
+    }
+
+    private static String bits(int value) {
+        String s = Integer.toBinaryString(value);
+        while (s.length() < QUBITS) {
+            s = "0" + s;
+        }
+        return s;
+    }
+
+    private static String f(double value, int digits) {
+        return String.format(Locale.US, "%." + digits + "f", value);
+    }
+
+    private static String h(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+    private static class DataSet {
+        final double[][] x;
+        final int[] y;
+        final String targetName;
+        final String c0;
+        final String c1;
+
+        DataSet(double[][] x, int[] y, String targetName, String c0, String c1) {
+            this.x = x;
+            this.y = y;
+            this.targetName = targetName;
+            this.c0 = c0;
+            this.c1 = c1;
+        }
+    }
+
+    private static class Split {
+        final double[][] trX;
+        final int[] trY;
+        final double[][] teX;
+        final int[] teY;
+
+        Split(double[][] trX, int[] trY, double[][] teX, int[] teY) {
+            this.trX = trX;
+            this.trY = trY;
+            this.teX = teX;
+            this.teY = teY;
+        }
+    }
+
+    private static class Prepared {
+        String name;
+        String targetName;
+        String label0;
+        String label1;
+
+        int loadedTotal;
+        int loadedFeatures;
+        int loaded0;
+        int loaded1;
+        int used0;
+        int used1;
+
+        int trainBefore0;
+        int trainBefore1;
+        int test0;
+        int test1;
+        int synthetic;
+        int trainAfter0;
+        int trainAfter1;
+
+        int pcaDims;
+        double[][] trainPCA;
+        double[][] testPCA;
+        int[] trainY;
+        int[] testY;
+
+        double[] centroidState0;
+        double[] centroidState1;
+        double centroidOverlap;
+    }
+
+    private static class Evaluation {
+        String method;
+        double threshold;
+        int testCount;
+        int[][] confusion;
+        int[] predicted;
+        int[] actual;
+        double[][] probs;
+        double maxDeviation;
+
+        double accuracy;
+        double precision;
+        double recall;
+        double f1;
+
+        double[] firstState;
+        double firstA0;
+        double firstA1;
+    }
+
+    private static class Alg2Report {
+        int qubits;
+        MultiQubitEnc.Circuit firstCircuit;
+        MultiQubitEnc.Circuit centroidCircuit0;
+        MultiQubitEnc.Circuit centroidCircuit1;
+        double[] firstTarget;
+        double[] firstEncoded;
+
+        int checked;
+        double minFidelity;
+        double meanFidelity;
+        double maxError;
+    }
+
+    private static class Encoded {
+        double[][] trainStates;
+        MultiQubitEnc.Circuit[] trainCircuits;
+        double[][] testStates;
+        MultiQubitEnc.Circuit[] testCircuits;
+    }
+
+    private static class Training {
+        double[] theta0;
+        double[] theta;
+        List<Double> lossHistory;
+        int evaluations;
+        String stop;
+        double initialLoss;
+        double finalLoss;
+    }
+
+    private static class DatasetResult {
+        String name;
+        String error;
+        Prepared prep;
+        Encoded enc;
+        MultiQubitEnc.Circuit circuit0;
+        MultiQubitEnc.Circuit circuit1;
+
+        Evaluation eval1;
+        Alg2Report report2;
+        Evaluation evalCombined;       
+        Evaluation evalCombined3;      
+        Training training4;
+        Evaluation eval4;
+        Novelty.Result zgatroOptimization;
+        Evaluation evalZGATRO;
+        double[][] zgatroNoiseAcc;
+        Training trainingVar;
+        Evaluation evalVar;
+        List<Evaluation> classical;
+        double[][] noiseAcc;
+    }
+}

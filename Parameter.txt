@@ -1,0 +1,404 @@
+package qfdnn;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+
+/**
+ * Algorithm 3 : parametrized circuit construction (Fig. 3c of the paper).
+ *
+ *   layer 1 : RY(params[c]) on every qubit
+ *   layer 2 : RZ(params[c]) on every qubit
+ *   layer 3 : CX from qubit i to qubit i+1, i = 0 .. n-2
+ *   layer 4 : RY(params[c]) on every qubit
+ *
+ * RZ makes the amplitudes complex, so this class simulates the state with
+ * two arrays (real part and imaginary part). Qubit 0 is the most significant
+ * bit of the basis index, the same convention MultiQubitEnc uses.
+ *
+ * The class also holds the six noise channels used for the noise study.
+ */
+public class Parameter {
+
+    public static class Op {
+        public final String name;      // RY, RZ or CX
+        public final int target;
+        public final int control;      // -1 when there is no control
+        public final int paramIndex;   // -1 for CX
+        public final double angle;
+
+        public Op(String name, int target, int control, int paramIndex, double angle) {
+            this.name = name;
+            this.target = target;
+            this.control = control;
+            this.paramIndex = paramIndex;
+            this.angle = angle;
+        }
+    }
+
+    public static class Circuit {
+        public final int qubits;
+        public final List<Op> ops;
+        public final int paramCount;
+
+        public Circuit(int qubits, List<Op> ops, int paramCount) {
+            this.qubits = qubits;
+            this.ops = ops;
+            this.paramCount = paramCount;
+        }
+    }
+
+    public static final String[] NOISE_NAMES = {
+        "Amplitude Damping", "Phase Damping", "Depolarizing",
+        "Bit Flip", "Phase Flip", "Bit-Phase Flip"
+    };
+
+    /** number of angles needed for n qubits : n (RY) + n (RZ) + n (RY) */
+    public static int paramCount(int n) {
+        return 3 * n;
+    }
+
+    /** Algorithm 3 : construct_circuit(qc, params) */
+    public static Circuit constructCircuit(int n, double[] params) {
+
+        if (params.length < paramCount(n)) {
+            throw new IllegalArgumentException("Need " + paramCount(n) + " parameters, got " + params.length);
+        }
+
+        List<Op> ops = new ArrayList<Op>();
+        int c = 0;
+
+        for (int i = 0; i < n; i++) {
+            ops.add(new Op("RY", i, -1, c, params[c]));
+            c++;
+        }
+        for (int i = 0; i < n; i++) {
+            ops.add(new Op("RZ", i, -1, c, params[c]));
+            c++;
+        }
+        for (int i = 0; i < n - 1; i++) {
+            ops.add(new Op("CX", i + 1, i, -1, 0.0));
+        }
+        for (int i = 0; i < n; i++) {
+            ops.add(new Op("RY", i, -1, c, params[c]));
+            c++;
+        }
+
+        return new Circuit(n, ops, c);
+    }
+
+    public static void apply(Circuit circuit, double[] re, double[] im) {
+        for (Op op : circuit.ops) {
+            applyOp(op, circuit.qubits, re, im);
+        }
+    }
+
+    public static void applyOp(Op op, int n, double[] re, double[] im) {
+        if (op.name.equals("RY")) {
+            ry(re, im, n, op.target, op.angle);
+        } else if (op.name.equals("RZ")) {
+            rz(re, im, n, op.target, op.angle);
+        } else {
+            cx(re, im, n, op.control, op.target);
+        }
+    }
+
+    private static int maskOf(int n, int q) {
+        return 1 << (n - 1 - q);
+    }
+
+    private static void ry(double[] re, double[] im, int n, int q, double theta) {
+        int mask = maskOf(n, q);
+        double c = Math.cos(theta / 2.0);
+        double s = Math.sin(theta / 2.0);
+        for (int i = 0; i < re.length; i++) {
+            if ((i & mask) != 0) {
+                continue;
+            }
+            int j = i | mask;
+            double ar = re[i], br = re[j], ai = im[i], bi = im[j];
+            re[i] = c * ar - s * br;
+            re[j] = s * ar + c * br;
+            im[i] = c * ai - s * bi;
+            im[j] = s * ai + c * bi;
+        }
+    }
+
+    private static void rz(double[] re, double[] im, int n, int q, double theta) {
+        int mask = maskOf(n, q);
+        double c = Math.cos(theta / 2.0);
+        double s = Math.sin(theta / 2.0);
+        for (int i = 0; i < re.length; i++) {
+            double r = re[i];
+            double m = im[i];
+            if ((i & mask) == 0) {              // multiply by e^{-i theta/2}
+                re[i] = r * c + m * s;
+                im[i] = m * c - r * s;
+            } else {                            // multiply by e^{+i theta/2}
+                re[i] = r * c - m * s;
+                im[i] = m * c + r * s;
+            }
+        }
+    }
+
+    private static void cx(double[] re, double[] im, int n, int control, int target) {
+        int cm = maskOf(n, control);
+        int tm = maskOf(n, target);
+        for (int i = 0; i < re.length; i++) {
+            if ((i & cm) != 0 && (i & tm) == 0) {
+                int j = i | tm;
+                double tr = re[i];
+                double ti = im[i];
+                re[i] = re[j];
+                im[i] = im[j];
+                re[j] = tr;
+                im[j] = ti;
+            }
+        }
+    }
+
+    /** Text drawing of the variational circuit (Fig. 3c). */
+    public static List<String> diagram(Circuit circuit) {
+
+        String controller = "\u25CF";
+        String xor = "\u2295";
+        int cellWidth = 11;
+        List<String> lines = new ArrayList<String>();
+
+        for (int row = 0; row < circuit.qubits; row++) {
+
+            StringBuilder line = new StringBuilder();
+            line.append("q").append(row + 1).append(" |0> --");
+
+            for (Op op : circuit.ops) {
+
+                String cell = "";
+
+                if (op.name.equals("CX")) {
+                    if (row == op.control) {
+                        cell = "---" + controller;
+                    } else if (row == op.target) {
+                        cell = "---" + xor;
+                    }
+                } else if (row == op.target) {
+                    cell = "-[" + op.name + " p" + op.paramIndex + "]";
+                }
+
+                while (cell.length() < cellWidth) {
+                    cell = cell + "-";
+                }
+                line.append(cell);
+            }
+
+            lines.add(line.toString());
+        }
+
+        return lines;
+    }
+
+    // ------------------------------------------------------------------
+    //  Noisy simulation of the whole QFDNN circuit  U -> PQC -> U^dagger -> PQC
+    // ------------------------------------------------------------------
+
+    /** One U gate of Algorithm 2 on a complex state (same maths as MultiQubitEnc). */
+    private static void applyEncGate(double[] re, double[] im, int n, MultiQubitEnc.Gate gate, double sign) {
+
+        int bit = n - 1 - gate.target;
+        int mask = 1 << bit;
+        double half = sign * gate.angle / 2.0;
+        double cos = Math.cos(half);
+        double sin = Math.sin(half);
+
+        for (int i = 0; i < re.length; i++) {
+            if ((i & mask) != 0) {
+                continue;
+            }
+            if ((i >> (bit + 1)) != gate.pattern) {
+                continue;
+            }
+            int j = i | mask;
+            double ar = re[i], br = re[j], ai = im[i], bi = im[j];
+            re[i] = cos * ar - sin * br;
+            re[j] = sin * ar + cos * br;
+            im[i] = cos * ai - sin * bi;
+            im[j] = sin * ai + cos * bi;
+        }
+    }
+
+    /**
+     * One noisy run (one quantum trajectory). After every gate, the chosen
+     * noise channel hits each qubit that the gate touched. Returns the
+     * probability of measuring |000>. noiseType &lt; 0 means no noise.
+     */
+    public static double runNoisy(MultiQubitEnc.Circuit test, double[] theta1,
+                                  MultiQubitEnc.Circuit centroid, double[] theta2,
+                                  int noiseType, double p, Random rnd) {
+
+        int n = test.qubits;
+        double[] re = new double[1 << n];
+        double[] im = new double[1 << n];
+        re[0] = 1.0;
+
+        for (MultiQubitEnc.Gate g : test.gates) {
+            applyEncGate(re, im, n, g, 1.0);
+            for (int q = 0; q <= g.target; q++) {
+                applyNoise(noiseType, p, q, re, im, n, rnd);
+            }
+        }
+
+        runNoisyPqc(constructCircuit(n, theta1), re, im, noiseType, p, rnd);
+
+        for (int k = centroid.gates.size() - 1; k >= 0; k--) {
+            MultiQubitEnc.Gate g = centroid.gates.get(k);
+            applyEncGate(re, im, n, g, -1.0);
+            for (int q = 0; q <= g.target; q++) {
+                applyNoise(noiseType, p, q, re, im, n, rnd);
+            }
+        }
+
+        runNoisyPqc(constructCircuit(n, theta2), re, im, noiseType, p, rnd);
+
+        return re[0] * re[0] + im[0] * im[0];
+    }
+
+    private static void runNoisyPqc(Circuit pqc, double[] re, double[] im,
+                                    int noiseType, double p, Random rnd) {
+        for (Op op : pqc.ops) {
+            applyOp(op, pqc.qubits, re, im);
+            applyNoise(noiseType, p, op.target, re, im, pqc.qubits, rnd);
+            if (op.control >= 0) {
+                applyNoise(noiseType, p, op.control, re, im, pqc.qubits, rnd);
+            }
+        }
+    }
+
+    public static void applyNoise(int type, double p, int q, double[] re, double[] im,
+                                  int n, Random rnd) {
+
+        if (type < 0 || p <= 0.0) {
+            return;
+        }
+        int mask = maskOf(n, q);
+
+        switch (type) {
+            case 0: {   // amplitude damping : E0 = diag(1, sqrt(1-p)), E1 = sqrt(p)|0><1|
+                double p1 = probabilityOfOne(re, im, mask);
+                if (rnd.nextDouble() < p * p1) {
+                    for (int i = 0; i < re.length; i++) {
+                        if ((i & mask) == 0) {
+                            int j = i | mask;
+                            re[i] = re[j];
+                            im[i] = im[j];
+                            re[j] = 0.0;
+                            im[j] = 0.0;
+                        }
+                    }
+                } else {
+                    double f = Math.sqrt(1.0 - p);
+                    for (int i = 0; i < re.length; i++) {
+                        if ((i & mask) != 0) {
+                            re[i] *= f;
+                            im[i] *= f;
+                        }
+                    }
+                }
+                normalize(re, im);
+                break;
+            }
+            case 1: {   // phase damping : E0 = sqrt(1-p) I, E1 = sqrt(p)|0><0|, E2 = sqrt(p)|1><1|
+                if (rnd.nextDouble() < p) {
+                    double p1 = probabilityOfOne(re, im, mask);
+                    boolean keepOne = rnd.nextDouble() < p1;
+                    for (int i = 0; i < re.length; i++) {
+                        boolean isOne = (i & mask) != 0;
+                        if (isOne != keepOne) {
+                            re[i] = 0.0;
+                            im[i] = 0.0;
+                        }
+                    }
+                    normalize(re, im);
+                }
+                break;
+            }
+            case 2: {   // depolarizing : rho -> (1-p) rho + p I/2
+                if (rnd.nextDouble() < p) {
+                    int pauli = rnd.nextInt(4);
+                    if (pauli == 1) pauliX(re, im, mask);
+                    else if (pauli == 2) pauliY(re, im, mask);
+                    else if (pauli == 3) pauliZ(re, im, mask);
+                }
+                break;
+            }
+            case 3:
+                if (rnd.nextDouble() < p) pauliX(re, im, mask);
+                break;
+            case 4:
+                if (rnd.nextDouble() < p) pauliZ(re, im, mask);
+                break;
+            default:
+                if (rnd.nextDouble() < p) pauliY(re, im, mask);
+                break;
+        }
+    }
+
+    private static double probabilityOfOne(double[] re, double[] im, int mask) {
+        double s = 0.0;
+        for (int i = 0; i < re.length; i++) {
+            if ((i & mask) != 0) {
+                s += re[i] * re[i] + im[i] * im[i];
+            }
+        }
+        return s;
+    }
+
+    private static void normalize(double[] re, double[] im) {
+        double s = 0.0;
+        for (int i = 0; i < re.length; i++) {
+            s += re[i] * re[i] + im[i] * im[i];
+        }
+        if (s < 1.0e-15) {
+            return;
+        }
+        double f = 1.0 / Math.sqrt(s);
+        for (int i = 0; i < re.length; i++) {
+            re[i] *= f;
+            im[i] *= f;
+        }
+    }
+
+    private static void pauliX(double[] re, double[] im, int mask) {
+        for (int i = 0; i < re.length; i++) {
+            if ((i & mask) == 0) {
+                int j = i | mask;
+                double tr = re[i], ti = im[i];
+                re[i] = re[j];
+                im[i] = im[j];
+                re[j] = tr;
+                im[j] = ti;
+            }
+        }
+    }
+
+    private static void pauliZ(double[] re, double[] im, int mask) {
+        for (int i = 0; i < re.length; i++) {
+            if ((i & mask) != 0) {
+                re[i] = -re[i];
+                im[i] = -im[i];
+            }
+        }
+    }
+
+    /** Y|0> = i|1>,  Y|1> = -i|0> */
+    private static void pauliY(double[] re, double[] im, int mask) {
+        for (int i = 0; i < re.length; i++) {
+            if ((i & mask) == 0) {
+                int j = i | mask;
+                double r0 = re[i], i0 = im[i], r1 = re[j], i1 = im[j];
+                re[j] = -i0;
+                im[j] = r0;
+                re[i] = i1;
+                im[i] = -r1;
+            }
+        }
+    }
+}

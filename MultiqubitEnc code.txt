@@ -1,0 +1,204 @@
+package qfdnn;
+
+import java.util.ArrayList;
+import java.util.List;
+public class MultiQubitEnc {
+    public static class Gate {
+        public final int number;      
+        public final int target;     
+        public final int pattern;    
+        public final double angle;    
+
+        public Gate(int number, int target, int pattern, double angle) {
+            this.number = number;
+            this.target = target;
+            this.pattern = pattern;
+            this.angle = angle;
+        }
+        public boolean isController(int controlQubit) {
+            int shift = target - 1 - controlQubit;
+            return ((pattern >> shift) & 1) == 1;
+        }
+        public String controlsText() {
+
+            if (target == 0) {
+                return "none (single U gate)";
+            }
+
+            StringBuilder sb = new StringBuilder();
+
+            for (int q = 0; q < target; q++) {
+                if (q > 0) {
+                    sb.append(", ");
+                }
+                sb.append("q").append(q + 1);
+                if (isController(q)) {
+                    sb.append(" = controller");
+                } else {
+                    sb.append(" = anti-controller");
+                }
+            }
+
+            return sb.toString();
+        }
+    }
+    public static class Circuit {
+
+        public final int qubits;
+        public final List<Gate> gates;
+        public final double[] targetState;    
+
+        public Circuit(int qubits, List<Gate> gates, double[] targetState) {
+            this.qubits = qubits;
+            this.gates = gates;
+            this.targetState = targetState;
+        }
+
+        public int gateCount() {
+            return gates.size();
+        }
+        public int gatesOnQubit(int q) {
+            int count = 0;
+            for (Gate g : gates) {
+                if (g.target == q) {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+    public static Circuit encode(double[] amplitudes, int n) {
+
+        int size = 1 << n;
+
+        if (amplitudes.length != size) {
+            throw new IllegalArgumentException("Need " + size + " amplitudes for " + n + " qubits.");
+        }
+
+        List<Gate> gates = new ArrayList<Gate>();
+        int number = 0;
+
+        for (int i = 1; i <= n; i++) {
+
+            int target = i - 1;                 
+            int combinations = 1 << target;    
+            for (int pattern = combinations - 1; pattern >= 0; pattern--) {
+
+                number++;
+                double angle = computeAngle(amplitudes, n, target, pattern);
+                gates.add(new Gate(number, target, pattern, angle));
+            }
+        }
+
+        return new Circuit(n, gates, amplitudes.clone());
+    }
+    private static double computeAngle(double[] amp, int n, int target, int pattern) {
+
+        int size = 1 << n;
+        int block = size >> target;
+        int half = block / 2;
+        int start = pattern * block;
+
+        if (target == n - 1) {
+            return 2.0 * Math.atan2(amp[start + 1], amp[start]);
+        }
+
+        double lower = normRange(amp, start, half);
+        double upper = normRange(amp, start + half, half);
+
+        return 2.0 * Math.atan2(upper, lower);
+    }
+    private static void applyGate(double[] state, int n, Gate gate, double sign) {
+
+        int size = 1 << n;
+        int bit = n - 1 - gate.target;
+        int mask = 1 << bit;
+
+        double halfAngle = sign * gate.angle / 2.0;
+        double cos = Math.cos(halfAngle);
+        double sin = Math.sin(halfAngle);
+
+        for (int i = 0; i < size; i++) {
+            if ((i & mask) != 0) {
+                continue;
+            }
+            int controlValue = i >> (bit + 1);
+            if (controlValue != gate.pattern) {
+                continue;
+            }
+
+            int j = i | mask;
+            double a = state[i];
+            double b = state[j];
+
+            state[i] = cos * a - sin * b;
+            state[j] = sin * a + cos * b;
+        }
+    }
+    public static double[] run(Circuit circuit) {
+
+        double[] state = new double[1 << circuit.qubits];
+        state[0] = 1.0;
+
+        for (Gate gate : circuit.gates) {
+            applyGate(state, circuit.qubits, gate, +1.0);
+        }
+
+        return state;
+    }
+    public static void runInverse(double[] state, Circuit circuit) {
+
+        for (int k = circuit.gates.size() - 1; k >= 0; k--) {
+            applyGate(state, circuit.qubits, circuit.gates.get(k), -1.0);
+        }
+    }
+    public static double overlapAmplitude(Circuit testCircuit, Circuit centroidCircuit) {
+
+        double[] state = run(testCircuit);
+        runInverse(state, centroidCircuit);
+
+        return state[0];
+    }
+    public static double fidelity(Circuit circuit) {
+
+        double[] encoded = run(circuit);
+        double sum = 0.0;
+
+        for (int i = 0; i < encoded.length; i++) {
+            sum += encoded[i] * circuit.targetState[i];
+        }
+
+        return sum * sum;
+    }
+    public static double maxAmplitudeError(Circuit circuit) {
+
+        double[] encoded = run(circuit);
+        double error = 0.0;
+
+        for (int i = 0; i < encoded.length; i++) {
+            error = Math.max(error, Math.abs(encoded[i] - circuit.targetState[i]));
+        }
+
+        return error;
+    }
+    public static List<Gate> orderedGates(Circuit circuit, boolean inverse) {
+
+        List<Gate> list = new ArrayList<Gate>(circuit.gates);
+
+        if (inverse) {
+            java.util.Collections.reverse(list);
+        }
+
+        return list;
+    }
+    private static double normRange(double[] a, int from, int length) {
+
+        double sum = 0.0;
+
+        for (int i = from; i < from + length; i++) {
+            sum += a[i] * a[i];
+        }
+
+        return Math.sqrt(sum);
+    }
+}

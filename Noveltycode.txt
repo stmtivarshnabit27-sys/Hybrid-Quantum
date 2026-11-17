@@ -1,0 +1,128 @@
+package qfdnn;
+import java.util.Locale;
+public final class Novelty {
+    private Novelty() {}
+    public interface Objective {
+        double value(double[] theta);
+    }
+    public static final class Result {
+        public final double[] theta;
+        public final double initialLoss;
+        public final double finalLoss;
+        public final int evaluations;
+        public final int acceptedSteps;
+        public final int rejectedSteps;
+        public final double finalRadius;
+        private Result(double[] theta, double initialLoss, double finalLoss,
+                       int evaluations, int acceptedSteps, int rejectedSteps,
+                       double finalRadius) {
+            this.theta = theta.clone();
+            this.initialLoss = initialLoss;
+            this.finalLoss = finalLoss;
+            this.evaluations = evaluations;
+            this.acceptedSteps = acceptedSteps;
+            this.rejectedSteps = rejectedSteps;
+            this.finalRadius = finalRadius;
+        }
+    }
+    public static double extrapolateZeroNoise(double[] scales, double[] values) {
+        if (scales == null || values == null || scales.length != values.length
+                || scales.length < 2) {
+            throw new IllegalArgumentException("At least two matching scale/value points are required.");
+        }
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (int i = 0; i < scales.length; i++) {
+            if (!Double.isFinite(scales[i]) || !Double.isFinite(values[i])) {
+                throw new IllegalArgumentException("ZNE values must be finite.");
+            }
+            sx += scales[i];
+            sy += values[i];
+            sxx += scales[i] * scales[i];
+            sxy += scales[i] * values[i];
+        }
+        double n = scales.length;
+        double denominator = n * sxx - sx * sx;
+        if (Math.abs(denominator) < 1e-12) {
+            throw new IllegalArgumentException("Noise scales must not all be identical.");
+        }
+        double slope = (n * sxy - sx * sy) / denominator;
+        double intercept = (sy - slope * sx) / n;
+        return Math.max(0.0, Math.min(1.0, intercept));
+    }
+    public static Result optimize(double[] initial, Objective objective,
+                                  int maxIterations, double finiteDifferenceStep,
+                                  double initialRadius, double minimumRadius) {
+        if (initial == null || initial.length == 0 || objective == null) {
+            throw new IllegalArgumentException("Initial parameters and objective are required.");
+        }
+        if (maxIterations < 1 || finiteDifferenceStep <= 0
+                || initialRadius <= 0 || minimumRadius <= 0
+                || minimumRadius > initialRadius) {
+            throw new IllegalArgumentException("Invalid optimizer configuration.");
+        }
+
+        double[] theta = initial.clone();
+        double loss = objective.value(theta.clone());
+        double initialLoss = loss;
+        int evals = 1, accepted = 0, rejected = 0;
+        double radius = initialRadius;
+
+        for (int iter = 0; iter < maxIterations && radius >= minimumRadius; iter++) {
+            double[] grad = new double[theta.length];
+            for (int j = 0; j < theta.length; j++) {
+                double[] plus = theta.clone();
+                double[] minus = theta.clone();
+                plus[j] += finiteDifferenceStep;
+                minus[j] -= finiteDifferenceStep;
+                double fp = objective.value(plus);
+                double fm = objective.value(minus);
+                evals += 2;
+                grad[j] = (fp - fm) / (2.0 * finiteDifferenceStep);
+            }
+
+            double norm = 0.0;
+            for (double g : grad) norm += g * g;
+            norm = Math.sqrt(norm);
+            if (!Double.isFinite(norm) || norm < 1e-10) break;
+
+            double[] candidate = theta.clone();
+            double stepNorm = 0.0;
+            for (int j = 0; j < candidate.length; j++) {
+                double step = -radius * grad[j] / norm;
+                candidate[j] += step;
+                stepNorm += step * step;
+            }
+            double candidateLoss = objective.value(candidate);
+            evals++;
+
+            if (Double.isFinite(candidateLoss) && candidateLoss < loss) {
+                double improvement = loss - candidateLoss;
+                theta = candidate;
+                loss = candidateLoss;
+                accepted++;
+                radius = Math.min(initialRadius * 4.0, radius * (improvement > 0.01 ? 1.35 : 1.10));
+            } else {
+                rejected++;
+                radius *= 0.5;
+            }
+        }
+        return new Result(theta, initialLoss, loss, evals, accepted, rejected, radius);
+    }
+
+    /** Wrap a dynamically generated Main dashboard section as a complete page fragment. */
+    static String wrapPage(String body) {
+        return "<div class='zgatro-page' data-module='Novelty.java'>" + body
+                + "<p class='note'>Optimizer module loaded: " + escape("Novelty.java")
+                + ". ZNE extrapolation and trust-region optimization functions are available to the Java training pipeline.</p></div>";
+    }
+
+    private static String escape(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
+    }
+    public static String description() {
+        return String.format(Locale.US,
+                "ZGATRO: ZNE scales {1,2,3}; central finite differences; adaptive trust region.");
+    }
+}
+
